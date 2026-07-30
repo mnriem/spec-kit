@@ -12,7 +12,6 @@ import hashlib
 import os
 import shutil
 import tempfile
-import zipfile
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -26,12 +25,12 @@ from rich.table import Table
 from .._console import console
 from .._assets import get_speckit_version
 from .._download_security import (
+    archive_format_from_name,
+    archive_suffix,
+    detect_archive_format,
     is_https_or_localhost_http,
-    normalize_zip_member_name,
-    open_zip_bounded,
-    portable_zip_path_key,
     read_response_limited,
-    read_zip_member_limited,
+    safe_extract_archive,
 )
 from .._init_options import is_ai_skills_enabled
 
@@ -538,22 +537,21 @@ def extension_add(
                 )
 
             elif from_url:
-                # Install from URL (ZIP file)
-                import io
+                # Install from an archive URL.
                 import urllib.error
 
                 console.print(f"Downloading from {safe_url}...")
 
-                # Download ZIP to temp location
+                # Download the archive to a project-local temporary file.
                 download_dir = project_root / ".specify" / "extensions" / ".cache" / "downloads"
                 download_dir.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
                     prefix="extension-url-download-",
-                    suffix=".zip",
+                    suffix=".archive",
                     dir=download_dir,
                     delete=False,
                 ) as download_file:
-                    zip_path = Path(download_file.name)
+                    archive_path = Path(download_file.name)
 
                 try:
                     # Use the catalog's authenticated fetch so configured
@@ -571,26 +569,55 @@ def extension_add(
                     with dl_catalog._open_url(
                         download_url, timeout=60, extra_headers=extra_headers
                     ) as response:
-                        zip_data = read_response_limited(
+                        archive_data = read_response_limited(
                             response,
                             error_type=ExtensionError,
                             label=f"extension {from_url}",
                         )
+                        final_url = (
+                            response.geturl()
+                            if hasattr(response, "geturl")
+                            else download_url
+                        )
+                        content_type = (
+                            response.getheader("Content-Type")
+                            if hasattr(response, "getheader")
+                            else None
+                        )
 
-                    if not zipfile.is_zipfile(io.BytesIO(zip_data)):
+                    archive_path.write_bytes(archive_data)
+                    try:
+                        format_source = (
+                            final_url
+                            if archive_format_from_name(final_url) is not None
+                            else from_url
+                        )
+                        archive_format = detect_archive_format(
+                            archive_path,
+                            source_name=format_source,
+                            content_type=content_type,
+                            error_type=ExtensionError,
+                        )
+                    except ExtensionError:
                         console.print(
                             f"[red]Error:[/red] {safe_url} did not return a ZIP archive "
-                            f"(got {len(zip_data)} bytes). This usually means the request "
-                            f"was not authenticated and a login/HTML page was returned. "
-                            f"Verify the URL is correct and that credentials for its host "
-                            f"are configured in ~/.specify/auth.json."
+                            "or tar.gz/tgz archive "
+                            f"(got {len(archive_data)} bytes). This usually means "
+                            "the request was not authenticated and a login/HTML page was "
+                            "returned. Verify the URL and configured credentials."
                         )
                         raise typer.Exit(1)
-
-                    zip_path.write_bytes(zip_data)
-
-                    # Install from downloaded ZIP
-                    manifest = manager.install_from_zip(zip_path, speckit_version, priority=priority, force=force)
+                    detected_path = archive_path.with_suffix(
+                        archive_suffix(archive_format)
+                    )
+                    os.replace(archive_path, detected_path)
+                    archive_path = detected_path
+                    manifest = manager.install_from_zip(
+                        archive_path,
+                        speckit_version,
+                        priority=priority,
+                        force=force,
+                    )
                 except urllib.error.URLError as e:
                     console.print(
                         f"[red]Error:[/red] Failed to download from {safe_url}: "
@@ -598,9 +625,8 @@ def extension_add(
                     )
                     raise typer.Exit(1)
                 finally:
-                    # Clean up downloaded ZIP
-                    if zip_path.exists():
-                        zip_path.unlink()
+                    if archive_path.exists():
+                        archive_path.unlink()
 
             else:
                 # Try bundled extensions first (shipped with spec-kit)
@@ -660,18 +686,21 @@ def extension_add(
                             )
                             raise typer.Exit(1)
 
-                        # Download extension ZIP (use resolved ID, not original argument which may be display name)
+                        # Download extension archive (use the resolved catalog ID).
                         extension_id = ext_info['id']
                         console.print(f"Downloading {_escape_markup(str(ext_info['name']))} v{_escape_markup(str(ext_info.get('version', 'unknown')))}...")
-                        zip_path = catalog.download_extension(extension_id)
+                        archive_path = catalog.download_extension(extension_id)
 
                         try:
-                            # Install from downloaded ZIP
-                            manifest = manager.install_from_zip(zip_path, speckit_version, priority=priority, force=force)
+                            manifest = manager.install_from_zip(
+                                archive_path,
+                                speckit_version,
+                                priority=priority,
+                                force=force,
+                            )
                         finally:
-                            # Clean up downloaded ZIP
-                            if zip_path.exists():
-                                zip_path.unlink()
+                            if archive_path.exists():
+                                archive_path.unlink()
 
         console.print("\n[green]✓[/green] Extension installed successfully!")
         console.print(f"\n[bold]{_escape_markup(str(manifest.name))}[/bold] (v{_escape_markup(str(manifest.version))})")
@@ -882,7 +911,7 @@ def extension_search(
                 console.print(f"\n  [yellow]⚠[/yellow]  Not directly installable from '{catalog_name}'.")
                 console.print(
                     f"  Add to an approved catalog with install_allowed: true, "
-                    f"or install from a ZIP URL: specify extension add {safe_id} --from <zip-url>"
+                    f"or install from an archive URL: specify extension add {safe_id} --from <archive-url>"
                 )
             console.print()
 
@@ -1510,131 +1539,58 @@ def extension_update(
                             backup_hooks[hook_name] = ext_hooks
 
                 # 5. Download new version
-                zip_path = catalog.download_extension(extension_id)
+                archive_path = catalog.download_extension(extension_id)
                 try:
-                    # 6. Validate extension ID from ZIP BEFORE modifying installation
-                    # Handle both root-level and nested extension.yml (GitHub auto-generated ZIPs)
-                    with open_zip_bounded(zip_path) as zf:
-                        import yaml
-                        manifest_data = None
-                        manifest_bytes = None
-                        namelist = zf.namelist()
-
-                        # Read the manifest under a hard size cap: this happens
-                        # before install_from_zip()'s safe_extract_zip(), so a
-                        # raw zf.open().read() here would bypass that bound and
-                        # let a zip-bomb extension.yml exhaust memory.
-                        # Normalize separators before choosing the manifest so
-                        # this pre-scan cannot approve one entry while extraction
-                        # later overwrites it with a backslash alias.
-                        manifest_candidates = []
-                        archive_entries = []
-                        for name in namelist:
-                            normalized_name = normalize_zip_member_name(name)
-                            parts = normalized_name.removesuffix("/").split(
-                                "/"
-                            )
-                            path_key = portable_zip_path_key(normalized_name)
-                            archive_entries.append(
-                                (normalized_name, parts)
-                            )
+                    # 6. Validate the archive and extension ID before modifying
+                    # the existing installation. The shared extractor applies
+                    # the same bounded security checks to ZIP and tar archives.
+                    with tempfile.TemporaryDirectory(
+                        prefix="speckit-update-archive-"
+                    ) as archive_tmpdir:
+                        extracted_root = Path(archive_tmpdir)
+                        try:
+                            safe_extract_archive(archive_path, extracted_root)
+                        except ValueError as exc:
                             if (
-                                len(parts) in {1, 2}
-                                and path_key[-1] == "extension.yml"
+                                "Conflicting path" in str(exc)
+                                and "extension.yml" in str(exc).casefold()
                             ):
-                                manifest_candidates.append(
-                                    (name, normalized_name, path_key)
-                                )
-
-                        seen_manifest_keys = {}
-                        for name, _normalized_name, path_key in manifest_candidates:
-                            previous = seen_manifest_keys.get(path_key)
-                            if previous is not None:
                                 raise ValueError(
                                     "Downloaded extension archive contains multiple "
                                     "extension.yml manifests"
-                                )
-                            seen_manifest_keys[path_key] = name
-
-                        for _name, normalized_name, _path_key in manifest_candidates:
-                            if normalized_name.split("/")[-1] != "extension.yml":
-                                raise ValueError(
-                                    "Downloaded extension archive manifest "
-                                    "filenames must use canonical "
-                                    "'extension.yml' casing"
-                                )
-
-                        root_manifest = next(
-                            (
-                                name
-                                for name, _normalized_name, path_key
-                                in manifest_candidates
-                                if path_key == ("extension.yml",)
-                            ),
-                            None,
+                                ) from exc
+                            raise
+                        manifest_root = extracted_root
+                        manifest_path = manifest_root / "extension.yml"
+                        if not manifest_path.exists():
+                            top_level = list(extracted_root.iterdir())
+                            if len(top_level) == 1 and top_level[0].is_dir():
+                                manifest_root = top_level[0]
+                                manifest_path = manifest_root / "extension.yml"
+                        if not manifest_path.is_file():
+                            raise ValueError(
+                                "Downloaded extension archive is missing 'extension.yml'"
+                            )
+                        manifest_bytes = manifest_path.read_bytes()
+                        parsed_manifest = yaml.safe_load(manifest_bytes)
+                        manifest_data = (
+                            parsed_manifest if parsed_manifest is not None else {}
                         )
-                        nested_manifests = [
-                            (name, normalized_name)
-                            for name, normalized_name, path_key
-                            in manifest_candidates
-                            if len(path_key) == 2
-                            and path_key[-1] == "extension.yml"
-                        ]
-                        manifest_path = root_manifest
-                        if manifest_path is None and len(nested_manifests) == 1:
-                            manifest_path, normalized_manifest_path = (
-                                nested_manifests[0]
-                            )
-                            manifest_root = normalized_manifest_path.split(
-                                "/", 1
-                            )[0]
-                            top_level_dirs = {
-                                parts[0]
-                                for normalized_name, parts in archive_entries
-                                if (
-                                    len(parts) > 1
-                                    or normalized_name.endswith("/")
-                                )
-                            }
-                            if top_level_dirs != {manifest_root}:
-                                raise ValueError(
-                                    "Downloaded extension archive with a "
-                                    "nested extension.yml must contain exactly "
-                                    "one top-level directory"
-                                )
-
-                        if manifest_path is not None:
-                            manifest_bytes = read_zip_member_limited(
-                                zf, manifest_path
-                            )
-                            parsed_manifest = yaml.safe_load(
-                                manifest_bytes
-                            )
-                            manifest_data = (
-                                parsed_manifest
-                                if parsed_manifest is not None
-                                else {}
-                            )
-
-                        if manifest_data is None:
-                            raise ValueError("Downloaded extension archive is missing 'extension.yml'")
                         if not isinstance(manifest_data, dict):
                             raise ValueError(
-                                "Invalid extension manifest in downloaded archive: expected YAML mapping"
+                                "Invalid extension manifest in downloaded archive: "
+                                "expected YAML mapping"
                             )
                         extension_data = manifest_data.get("extension", {})
                         if not isinstance(extension_data, dict):
                             raise ValueError(
-                                "Invalid extension manifest in downloaded archive: expected 'extension' mapping"
+                                "Invalid extension manifest in downloaded archive: "
+                                "expected 'extension' mapping"
                             )
 
                     # Run the same manifest and compatibility validation as a
                     # normal install while the existing extension is still
                     # untouched. Reuse the exact bounded bytes selected above.
-                    if manifest_bytes is None:
-                        raise ValueError(
-                            "Downloaded extension archive is missing 'extension.yml'"
-                        )
                     with tempfile.TemporaryDirectory(
                         prefix="speckit-update-manifest-"
                     ) as manifest_tmpdir:
@@ -1830,7 +1786,7 @@ def extension_update(
                     manager.remove(extension_id, keep_config=True)
 
                     # 8. Install new version
-                    _ = manager.install_from_zip(zip_path, speckit_version)
+                    _ = manager.install_from_zip(archive_path, speckit_version)
 
                     # Restore user config files from backup after successful install.
                     new_extension_dir = manager.extensions_dir / extension_id
@@ -1876,12 +1832,12 @@ def extension_update(
                                             hook["enabled"] = False
                                 hook_executor.save_project_config(config)
                 finally:
-                    # ZIP cleanup is housekeeping: never replace an install
+                    # Archive cleanup is housekeeping: never replace an install
                     # error or roll back an already committed update because a
                     # scanner temporarily locks the download on Windows.
-                    if zip_path.exists():
+                    if archive_path.exists():
                         try:
-                            zip_path.unlink()
+                            archive_path.unlink()
                         except OSError as error:
                             zip_cleanup_error = error
 
