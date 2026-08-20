@@ -250,6 +250,55 @@ Extension manifests reject invalid hook priorities during installation. For exis
 
 `HookExecutor.get_hooks_for_event()` returns hooks ordered by `priority`, with lower values first. However, current command templates read hook lists directly and surface them in their configured YAML order rather than using priority ordering.
 
+## Installation Registry and Provenance
+
+Spec Kit tracks every installed extension in an internal registry file:
+
+```text
+.specify/extensions/.registry
+```
+
+Each entry records how the extension was installed via a structured `source` object (installation provenance). This replaces the earlier free-form `"source": "local"` string.
+
+```json
+{
+  "schema_version": "1.0",
+  "extensions": {
+    "my-extension": {
+      "version": "1.0.0",
+      "installed_at": "2025-01-01T00:00:00+00:00",
+      "source": { "kind": "catalog", "catalog": "community" }
+    }
+  }
+}
+```
+
+### Source schema
+
+The `source` object always has a `kind` field plus kind-specific fields:
+
+| `kind` | Additional fields | Recorded when |
+| --- | --- | --- |
+| `local` | `path` (absolute) | Installed from a local directory. `path` is the resolved absolute path of the original source directory, not the install destination. |
+| `catalog` | `catalog` (name) | Installed from a catalog. `catalog` is the catalog name the entry was resolved from. |
+| `builtin` | *(none)* | Installed from the bundled templates that ship with Spec Kit. |
+| `git` | `url`, optional `ref` | Reserved schema-only kind; no installer currently writes it. |
+
+Extensions installed directly from an archive URL (`specify extension add --from <url>`) record a `local` source pointing at the temporary extraction path, since no single kind describes a raw archive URL.
+
+### Legacy normalization (read-only)
+
+Registry entries written by older Spec Kit versions used a bare string. These are normalized when the registry is read, without rewriting the file on disk:
+
+| Legacy value | Normalized to |
+| --- | --- |
+| missing / `null` | `{ "kind": "local" }` |
+| `"local"` | `{ "kind": "local" }` |
+| `"catalog"` | `{ "kind": "catalog", "catalog": null }` |
+| any other string / malformed value | `{ "kind": "local" }` |
+
+Updating or rolling back an extension preserves the original `source`, so an update does not change how an extension is recorded as having first entered the project. The registry `schema_version` stays `1.0` — no on-disk migration is performed.
+
 ## FAQ
 
 ### Why can't I find an extension with `search`?

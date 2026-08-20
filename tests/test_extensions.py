@@ -1417,9 +1417,11 @@ class TestExtensionRegistry:
         }
         registry.restore("test-ext", backup_data)
 
-        # Verify entry is exactly as restored
+        # Verify entry is exactly as restored. get() normalizes provenance on
+        # read, so a backup without a "source" field gains the default
+        # {"kind": "local"} — the registry file itself is not rewritten.
         restored_data = registry.get("test-ext")
-        assert restored_data == backup_data
+        assert restored_data == {**backup_data, "source": {"kind": "local"}}
 
     def test_restore_can_recreate_removed_entry(self, temp_dir):
         """Test that restore() can recreate an entry after remove()."""
@@ -9166,8 +9168,10 @@ class TestExtensionUpdateCLI:
         )
         v2_dir = self._create_extension_source(tmp_path, "2.0.0")
 
-        def fake_install_from_zip(self_obj, _zip_path, speckit_version):
-            return self_obj.install_from_directory(v2_dir, speckit_version)
+        def fake_install_from_zip(self_obj, _zip_path, speckit_version, **kwargs):
+            return self_obj.install_from_directory(
+                v2_dir, speckit_version, source=kwargs.get("source")
+            )
 
         with patch.object(Path, "cwd", return_value=project_dir), \
              patch.object(ExtensionCatalog, "get_extension_info", return_value={

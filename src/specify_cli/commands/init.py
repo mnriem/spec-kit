@@ -26,6 +26,7 @@ from .._assets import (
     get_speckit_version,
 )
 from .._console import StepTracker, console, select_with_arrows, show_banner
+from .._source_info import builtin_source, catalog_source
 from .._utils import check_tool
 
 
@@ -143,7 +144,9 @@ def _install_extension_during_init(project_path: Path, ext_spec: str, speckit_ve
     if bundled_path is not None:
         if manager.registry.is_installed(ext_spec):
             return "already installed"
-        manifest = manager.install_from_directory(bundled_path, speckit_version)
+        manifest = manager.install_from_directory(
+            bundled_path, speckit_version, source=builtin_source()
+        )
         return f"{manifest.name} v{manifest.version} installed"
 
     # Fall back to catalog
@@ -160,7 +163,9 @@ def _install_extension_during_init(project_path: Path, ext_spec: str, speckit_ve
         if bundled_path is not None:
             if manager.registry.is_installed(resolved_id):
                 return "already installed"
-            manifest = manager.install_from_directory(bundled_path, speckit_version)
+            manifest = manager.install_from_directory(
+                bundled_path, speckit_version, source=builtin_source()
+            )
             return f"{manifest.name} v{manifest.version} installed"
 
     if ext_info.get("bundled") and not ext_info.get("download_url"):
@@ -179,7 +184,11 @@ def _install_extension_during_init(project_path: Path, ext_spec: str, speckit_ve
 
     zip_path = catalog.download_extension(resolved_id)
     try:
-        manifest = manager.install_from_zip(zip_path, speckit_version)
+        manifest = manager.install_from_zip(
+            zip_path,
+            speckit_version,
+            source=catalog_source(ext_info.get("_catalog_name") or "community"),
+        )
     finally:
         zip_path.unlink(missing_ok=True)
     return f"{manifest.name} v{manifest.version} installed"
@@ -833,7 +842,7 @@ def register(app: typer.Typer) -> None:
                             bundled_path = _locate_bundled_preset(preset)
                             if bundled_path:
                                 preset_manager.install_from_directory(
-                                    bundled_path, speckit_ver
+                                    bundled_path, speckit_ver, source=builtin_source()
                                 )
                             else:
                                 preset_catalog = PresetCatalog(project_path)
@@ -862,7 +871,11 @@ def register(app: typer.Typer) -> None:
                                     try:
                                         zip_path = preset_catalog.download_pack(preset)
                                         preset_manager.install_from_zip(
-                                            zip_path, speckit_ver
+                                            zip_path,
+                                            speckit_ver,
+                                            source=catalog_source(
+                                                pack_info.get("_catalog_name") or "community"
+                                            ),
                                         )
                                     except PresetError as preset_err:
                                         _print_cli_warning(

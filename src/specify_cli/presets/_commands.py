@@ -17,6 +17,7 @@ import yaml
 from rich.markup import escape as _escape_markup
 
 from .._console import console
+from .._source_info import builtin_source, catalog_source
 from .._download_security import (
     archive_format_from_name,
     archive_suffix,
@@ -235,7 +236,7 @@ def preset_add(
             bundled_path = _locate_bundled_preset(preset_id)
             if bundled_path:
                 console.print(f"Installing bundled preset [cyan]{preset_id}[/cyan]...")
-                manifest = manager.install_from_directory(bundled_path, speckit_version, priority)
+                manifest = manager.install_from_directory(bundled_path, speckit_version, priority, source=builtin_source())
                 console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
             else:
                 catalog = PresetCatalog(project_root)
@@ -274,6 +275,9 @@ def preset_add(
                         archive_path,
                         speckit_version,
                         priority,
+                        source=catalog_source(
+                            pack_info.get("_catalog_name") or "community"
+                        ),
                     )
                     console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
                 finally:

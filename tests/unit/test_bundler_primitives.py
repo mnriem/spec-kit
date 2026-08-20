@@ -121,8 +121,9 @@ def test_preset_install_preserves_explicit_zero_priority(tmp_path: Path, monkeyp
     calls = {}
 
     class _FakeManager:
-        def install_from_directory(self, directory, speckit_version, priority):
+        def install_from_directory(self, directory, speckit_version, priority, source=None):
             calls["priority"] = priority
+            calls["source"] = source
 
     monkeypatch.setattr(assets, "_locate_bundled_preset", lambda cid: tmp_path)
 

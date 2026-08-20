@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .. import BundlerError
+from ..._source_info import builtin_source, catalog_source
 from ..models.manifest import ComponentRef
 
 DEFAULT_PRIORITY = 10
@@ -181,7 +182,8 @@ class _PresetKindManager:
                 _bundled_manifest_version(bundled / "preset.yml", "preset"),
             )
             self._manager.install_from_directory(
-                bundled, speckit_version, priority, **({"force": True} if force else {})
+                bundled, speckit_version, priority, source=builtin_source(),
+                **({"force": True} if force else {})
             )
             return
 
@@ -209,7 +211,9 @@ class _PresetKindManager:
         zip_path = catalog.download_pack(component.id)
         try:
             self._manager.install_from_zip(
-                zip_path, speckit_version, priority, **({"force": True} if force else {})
+                zip_path, speckit_version, priority,
+                source=catalog_source(info.get("_catalog_name") or "community"),
+                **({"force": True} if force else {})
             )
         finally:
             with contextlib.suppress(Exception):
@@ -264,7 +268,8 @@ class _ExtensionKindManager:
                 _bundled_manifest_version(bundled / "extension.yml", "extension"),
             )
             self._manager.install_from_directory(
-                bundled, speckit_version, priority=priority, force=force
+                bundled, speckit_version, priority=priority, force=force,
+                source=builtin_source(),
             )
             return
 
@@ -294,7 +299,8 @@ class _ExtensionKindManager:
         zip_path = catalog.download_extension(component.id)
         try:
             self._manager.install_from_zip(
-                zip_path, speckit_version, priority=priority, force=force
+                zip_path, speckit_version, priority=priority, force=force,
+                source=catalog_source(info.get("_catalog_name") or "community"),
             )
         finally:
             with contextlib.suppress(Exception):

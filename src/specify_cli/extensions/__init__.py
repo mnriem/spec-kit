@@ -40,6 +40,12 @@ from .._download_security import (
 )
 from .._init_options import is_ai_skills_enabled
 from .._invocation_style import is_dollar_skills_agent, is_slash_skills_agent
+from .._source_info import (
+    SourceInfo,
+    local_source,
+    normalize_source,
+    validate_source,
+)
 from .._utils import dump_frontmatter, relative_extension_path_violation, version_satisfies
 from ..catalogs import CatalogEntry as BaseCatalogEntry
 from ..catalogs import CatalogStackBase
@@ -926,7 +932,10 @@ class ExtensionRegistry:
         # Return None for missing or corrupted (non-dict) entries
         if entry is None or not isinstance(entry, dict):
             return None
-        return copy.deepcopy(entry)
+        result = copy.deepcopy(entry)
+        # Normalize provenance on read without rewriting the registry file.
+        result["source"] = normalize_source(result.get("source"))
+        return result
 
     def list(self) -> Dict[str, dict]:
         """Get all installed extensions with valid metadata.
@@ -940,12 +949,16 @@ class ExtensionRegistry:
         extensions = self.data.get("extensions", {}) or {}
         if not isinstance(extensions, dict):
             return {}
-        # Filter to only valid dict entries to match type contract
-        return {
-            ext_id: copy.deepcopy(meta)
-            for ext_id, meta in extensions.items()
-            if isinstance(meta, dict)
-        }
+        # Filter to only valid dict entries to match type contract.
+        # Normalize provenance on read without rewriting the registry file.
+        result: Dict[str, dict] = {}
+        for ext_id, meta in extensions.items():
+            if not isinstance(meta, dict):
+                continue
+            meta_copy = copy.deepcopy(meta)
+            meta_copy["source"] = normalize_source(meta_copy.get("source"))
+            result[ext_id] = meta_copy
+        return result
 
     def keys(self) -> set:
         """Get all extension IDs including corrupted entries.
@@ -2052,6 +2065,7 @@ class ExtensionManager:
         priority: int = 10,
         link_commands: bool = False,
         force: bool = False,
+        source: Optional[SourceInfo] = None,
     ) -> ExtensionManifest:
         """Install extension from a local directory.
 
@@ -2064,6 +2078,10 @@ class ExtensionManager:
                 symlinks to a dev cache when supported by the OS.
             force: If True and extension is already installed, remove it first
                    before proceeding with installation
+            source: Structured installation provenance (see ``_source_info``).
+                When omitted, defaults to a ``local`` source pointing at the
+                resolved ``source_dir`` — the original source directory, not the
+                install destination. Validated before persistence.
 
         Returns:
             Installed extension manifest
@@ -2075,6 +2093,17 @@ class ExtensionManager:
         # Validate priority
         if priority < 1:
             raise ValidationError("Priority must be a positive integer (1 or higher)")
+
+        # Validate any caller-supplied provenance up front so an invalid source
+        # fails before any filesystem changes. The default local source is
+        # computed later (after the self-install guard) so a resolve() failure
+        # surfaces through that guard rather than here.
+        source_info: Optional[SourceInfo] = None
+        if source is not None:
+            try:
+                source_info = validate_source(source)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
 
         # Load and validate manifest
         manifest_path = source_dir / "extension.yml"
@@ -2612,11 +2641,23 @@ class ExtensionManager:
                 backup_config_dir.unlink()
 
         # Update registry
+        # Update registry
+        if source_info is None:
+            # Default provenance: the original source directory, resolved to an
+            # absolute path. Mirror the self-install guard's resolve fallback so
+            # a resolve() failure degrades to an absolute path instead of
+            # raising after the install has otherwise committed on disk.
+            try:
+                resolved_source = source_dir.resolve()
+            except (OSError, RuntimeError):
+                resolved_source = source_dir.absolute()
+            source_info = local_source(resolved_source)
+
         self.registry.add(
             manifest.id,
             {
                 "version": manifest.version,
-                "source": "local",
+                "source": source_info,
                 "manifest_hash": manifest.get_hash(),
                 "enabled": True,
                 "priority": priority,
@@ -2673,6 +2714,7 @@ class ExtensionManager:
         archive_file: BinaryIO | None = None,
         source_name: str | None = None,
         content_type: str | None = None,
+        source: Optional[SourceInfo] = None,
     ) -> ExtensionManifest:
         """Install an extension from a supported archive.
 
@@ -2684,6 +2726,10 @@ class ExtensionManager:
                    before proceeding with installation
             archive_file: Already-open archive stream to consume instead of
                           reopening ``zip_path``
+            source: Structured installation provenance passed through to
+                ``install_from_directory``. Catalog callers supply
+                ``catalog_source(name)`` so the extracted temp directory is not
+                mistaken for a local install path.
 
         Returns:
             Installed extension manifest
@@ -2724,7 +2770,11 @@ class ExtensionManager:
 
             # Install from extracted directory
             return self.install_from_directory(
-                extension_dir, speckit_version, priority=priority, force=force
+                extension_dir,
+                speckit_version,
+                priority=priority,
+                force=force,
+                source=source,
             )
 
     def _config_root_is_contained(self, specify_dir: Path) -> bool:
@@ -2880,6 +2930,7 @@ class ExtensionManager:
         archive_file: BinaryIO | None = None,
         source_name: str | None = None,
         content_type: str | None = None,
+        source: Optional[SourceInfo] = None,
     ) -> ExtensionManifest:
         """Backward-compatible wrapper for archive installation."""
         return self.install_from_archive(
@@ -2890,6 +2941,7 @@ class ExtensionManager:
             archive_file=archive_file,
             source_name=source_name,
             content_type=content_type,
+            source=source,
         )
 
     def remove(self, extension_id: str, keep_config: bool = False) -> bool:

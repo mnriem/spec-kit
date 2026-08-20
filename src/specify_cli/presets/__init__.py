@@ -37,6 +37,12 @@ from .._download_security import (
     safe_extract_archive,
 )
 from ..extensions import REINSTALL_COMMAND, ExtensionRegistry, normalize_priority
+from .._source_info import (
+    SourceInfo,
+    local_source,
+    normalize_source,
+    validate_source,
+)
 from .._init_options import (
     MISSING_INIT_OPTIONS_FILE,
     is_ai_skills_enabled,
@@ -684,7 +690,10 @@ class PresetRegistry:
         # Return None for missing or corrupted (non-dict) entries
         if entry is None or not isinstance(entry, dict):
             return None
-        return copy.deepcopy(entry)
+        result = copy.deepcopy(entry)
+        # Normalize provenance on read without rewriting the registry file.
+        result["source"] = normalize_source(result.get("source"))
+        return result
 
     def list(self) -> Dict[str, dict]:
         """Get all installed presets with valid metadata.
@@ -698,12 +707,16 @@ class PresetRegistry:
         packs = self.data.get("presets", {}) or {}
         if not isinstance(packs, dict):
             return {}
-        # Filter to only valid dict entries to match type contract
-        return {
-            pack_id: copy.deepcopy(meta)
-            for pack_id, meta in packs.items()
-            if isinstance(meta, dict)
-        }
+        # Filter to only valid dict entries to match type contract.
+        # Normalize provenance on read without rewriting the registry file.
+        result: Dict[str, dict] = {}
+        for pack_id, meta in packs.items():
+            if not isinstance(meta, dict):
+                continue
+            meta_copy = copy.deepcopy(meta)
+            meta_copy["source"] = normalize_source(meta_copy.get("source"))
+            result[pack_id] = meta_copy
+        return result
 
     def keys(self) -> set:
         """Get all preset IDs including corrupted entries.
@@ -3537,6 +3550,7 @@ class PresetManager:
         speckit_version: str,
         priority: int = 10,
         force: bool = False,
+        source: Optional[SourceInfo] = None,
     ) -> PresetManifest:
         """Install preset from a local directory.
 
@@ -3545,6 +3559,10 @@ class PresetManager:
             speckit_version: Current spec-kit version
             priority: Resolution priority (lower = higher precedence, default 10)
             force: If True and the preset is already installed, remove it first
+            source: Structured installation provenance (see ``_source_info``).
+                When omitted, defaults to a ``local`` source pointing at the
+                resolved ``source_dir`` — the original source directory, not the
+                install destination. Validated before persistence.
 
         Returns:
             Installed preset manifest
@@ -3556,6 +3574,20 @@ class PresetManager:
         # Validate priority
         if priority < 1:
             raise PresetValidationError("Priority must be a positive integer (1 or higher)")
+
+        # Resolve and validate installation provenance up front so an invalid
+        # caller-supplied source fails before any filesystem changes.
+        if source is None:
+            try:
+                resolved_source = source_dir.resolve()
+            except (OSError, RuntimeError):
+                resolved_source = source_dir.absolute()
+            source_info = local_source(resolved_source)
+        else:
+            try:
+                source_info = validate_source(source)
+            except ValueError as exc:
+                raise PresetValidationError(str(exc)) from exc
 
         manifest_path = source_dir / "preset.yml"
         manifest = PresetManifest(manifest_path)
@@ -3580,7 +3612,7 @@ class PresetManager:
         # in the priority stack when resolving composed command content.
         self.registry.add(manifest.id, {
             "version": manifest.version,
-            "source": "local",
+            "source": source_info,
             "manifest_hash": manifest.get_hash(),
             "enabled": True,
             "priority": priority,
@@ -3719,6 +3751,7 @@ class PresetManager:
         speckit_version: str,
         priority: int = 10,
         force: bool = False,
+        source: Optional[SourceInfo] = None,
     ) -> PresetManifest:
         """Install a preset from a supported archive.
 
@@ -3727,6 +3760,10 @@ class PresetManager:
             speckit_version: Current spec-kit version
             priority: Resolution priority (lower = higher precedence, default 10)
             force: If True and the preset is already installed, remove it first
+            source: Structured installation provenance passed through to
+                ``install_from_directory``. Catalog callers supply
+                ``catalog_source(name)`` so the extracted temp directory is not
+                mistaken for a local install path.
 
         Returns:
             Installed preset manifest
@@ -3762,7 +3799,9 @@ class PresetManager:
                     "No preset.yml found in archive"
                 )
 
-            return self.install_from_directory(pack_dir, speckit_version, priority, force=force)
+            return self.install_from_directory(
+                pack_dir, speckit_version, priority, force=force, source=source
+            )
 
     def install_from_zip(
         self,
@@ -3770,6 +3809,7 @@ class PresetManager:
         speckit_version: str,
         priority: int = 10,
         force: bool = False,
+        source: Optional[SourceInfo] = None,
     ) -> PresetManifest:
         """Backward-compatible wrapper for archive installation."""
         return self.install_from_archive(
@@ -3777,6 +3817,7 @@ class PresetManager:
             speckit_version,
             priority,
             force=force,
+            source=source,
         )
 
     def remove(self, pack_id: str) -> bool:

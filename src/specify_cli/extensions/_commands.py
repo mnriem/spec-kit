@@ -9,6 +9,7 @@ which re-fetch from the parent package at call time so test monkeypatching of
 from __future__ import annotations
 
 import errno
+import copy
 import hashlib
 import os
 import shutil
@@ -26,6 +27,7 @@ from rich.table import Table
 
 from .._console import console
 from .._assets import get_speckit_version
+from .._source_info import builtin_source, catalog_source
 from .._download_security import (
     archive_format_from_name,
     detect_archive_format,
@@ -1011,7 +1013,8 @@ def extension_add(
                 bundled_path = _locate_bundled_extension(extension)
                 if bundled_path is not None:
                     manifest = manager.install_from_directory(
-                        bundled_path, speckit_version, priority=priority, force=force
+                        bundled_path, speckit_version, priority=priority, force=force,
+                        source=builtin_source(),
                     )
                 else:
                     # Install from catalog (also resolves display names to IDs)
@@ -1034,7 +1037,8 @@ def extension_add(
                         bundled_path = _locate_bundled_extension(resolved_id)
                         if bundled_path is not None:
                             manifest = manager.install_from_directory(
-                                bundled_path, speckit_version, priority=priority, force=force
+                                bundled_path, speckit_version, priority=priority, force=force,
+                                source=builtin_source(),
                             )
 
                     if bundled_path is None:
@@ -1087,6 +1091,9 @@ def extension_add(
                                 speckit_version,
                                 priority=priority,
                                 force=force,
+                                source=catalog_source(
+                                    ext_info.get("_catalog_name") or "community"
+                                ),
                             )
                         finally:
                             if archive_path.exists():
@@ -1665,6 +1672,7 @@ def extension_update(
                         "installed": str(installed_version),
                         "available": str(catalog_version),
                         "download_url": ext_info.get("download_url"),
+                        "catalog": ext_info.get("_catalog_name") or "community",
                     }
                 )
             else:
@@ -2263,7 +2271,11 @@ def extension_update(
                     manager.remove(extension_id, keep_config=True)
 
                     # 8. Install new version
-                    _ = manager.install_from_zip(archive_path, speckit_version)
+                    _ = manager.install_from_zip(
+                        archive_path,
+                        speckit_version,
+                        source=catalog_source(update.get("catalog") or "community"),
+                    )
 
                     # Restore user config files from backup after successful install.
                     new_extension_dir = manager.extensions_dir / extension_id
@@ -2290,6 +2302,16 @@ def extension_update(
                         # Preserve the original priority (normalized to handle corruption)
                         if "priority" in backup_registry_entry:
                             new_metadata["priority"] = normalize_priority(backup_registry_entry["priority"])
+
+                        # Preserve the original installation provenance. An update
+                        # re-downloads from the catalog but must not rewrite how the
+                        # extension first entered the project (e.g. a builtin or a
+                        # different catalog). Only fall back to the freshly recorded
+                        # catalog source when the backup predates provenance tracking.
+                        if "source" in backup_registry_entry:
+                            new_metadata["source"] = copy.deepcopy(
+                                backup_registry_entry["source"]
+                            )
 
                         # If extension was disabled before update, disable it again
                         if not backup_registry_entry.get("enabled", True):

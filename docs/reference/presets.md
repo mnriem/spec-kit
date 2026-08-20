@@ -205,6 +205,55 @@ specify preset add team-workflow --priority 10
 
 For any file that both provide, `compliance` wins (priority 5 < 10). For files only one provides, that one is used. For files neither provides, the core default is used.
 
+## Installation Registry and Provenance
+
+Spec Kit tracks every installed preset in an internal registry file:
+
+```text
+.specify/presets/.registry
+```
+
+Each entry records how the preset was installed via a structured `source` object (installation provenance). This replaces the earlier free-form `"source": "local"` string.
+
+```json
+{
+  "schema_version": "1.0",
+  "presets": {
+    "my-preset": {
+      "version": "1.0.0",
+      "installed_at": "2025-01-01T00:00:00+00:00",
+      "source": { "kind": "catalog", "catalog": "community" }
+    }
+  }
+}
+```
+
+### Source schema
+
+The `source` object always has a `kind` field plus kind-specific fields:
+
+| `kind` | Additional fields | Recorded when |
+| --- | --- | --- |
+| `local` | `path` (absolute) | Installed from a local directory. `path` is the resolved absolute path of the original source directory, not the install destination. |
+| `catalog` | `catalog` (name) | Installed from a catalog. `catalog` is the catalog name the entry was resolved from. |
+| `builtin` | *(none)* | Installed from the bundled presets that ship with Spec Kit. |
+| `git` | `url`, optional `ref` | Reserved schema-only kind; no installer currently writes it. |
+
+Presets installed directly from an archive URL record a `local` source pointing at the temporary extraction path, since no single kind describes a raw archive URL.
+
+### Legacy normalization (read-only)
+
+Registry entries written by older Spec Kit versions used a bare string. These are normalized when the registry is read, without rewriting the file on disk:
+
+| Legacy value | Normalized to |
+| --- | --- |
+| missing / `null` | `{ "kind": "local" }` |
+| `"local"` | `{ "kind": "local" }` |
+| `"catalog"` | `{ "kind": "catalog", "catalog": null }` |
+| any other string / malformed value | `{ "kind": "local" }` |
+
+Updating or rolling back a preset preserves the original `source`. The registry `schema_version` stays `1.0` — no on-disk migration is performed.
+
 ## FAQ
 
 ### Can I use multiple presets at the same time?

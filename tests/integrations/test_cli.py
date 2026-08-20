@@ -395,7 +395,7 @@ class TestInitIntegrationFlag:
         from specify_cli import app
         from specify_cli.presets import PresetManager
 
-        def fail_install(self, path, version):
+        def fail_install(self, path, version, source=None):
             raise OSError("preset install exploded\nwith context")
 
         monkeypatch.setattr(PresetManager, "install_from_directory", fail_install)
