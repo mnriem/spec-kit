@@ -505,8 +505,21 @@ Disclosure is **continuous**, not a one-time event. A single AI-disclosure parag
 
 ### Opening pull requests
 
+This guidance throttles **human-directed / interactive contribution work** — an agent
+opening PRs on a person's behalf. It does **not** apply to this repository's own
+agentic maintenance workflows (see the exemption below).
+
 - Before opening a pull request, check whether the account that will file it already has three open pull requests in this repository.
 - If so, alert the user that additional submissions may receive lower review priority and ask for explicit permission to proceed. Do not assume consent. If the user is unavailable to provide that permission, including during autonomous or non-interactive operation, do not open the pull request. Preserve the work on a branch and report that confirmation is required.
+
+**Exemption — the repository's own agentic workflows.** The catalog workflows
+(`add-community-extension`, `add-community-preset`, `add-community-bundle`) and the
+`bug-fix` workflow file PRs through the gh-aw `create-pull-request` safe output as
+part of the project's automated pipeline, not as a contributor flooding the review
+queue. When you are running as one of those workflows, the open-PR cap does **not**
+apply: always open the validated PR regardless of how many open pull requests the
+filing identity currently has, and never strand validated work on an un-pushed
+branch because of this cap.
 
 ### Commits
 

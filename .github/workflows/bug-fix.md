@@ -2,6 +2,12 @@
 description: "Apply the remediation from a prior bug assessment to a bug-fix-labeled issue and open a draft PR for human review"
 emoji: "🛠️"
 
+# Secondary guard only. The primary fix for the credit-burn failure is the
+# bash allow-list above (real venv/`python` test invocations); this ceiling
+# just prevents a runaway from aborting mid-fix if the agent legitimately needs
+# a few more turns.
+max-ai-credits: 2000
+
 on:
   issues:
     types: [labeled]
@@ -10,7 +16,7 @@ on:
 
 tools:
   edit:
-  bash: ["echo", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "python3", "jq", "date", "ls", "find", "pytest", "npm", "go", "cargo", "dotnet"]
+  bash: ["echo", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "python3", "python", ".venv/bin/python", "./.venv/bin/python", "jq", "date", "ls", "find", "pytest", "npm", "go", "cargo", "dotnet"]
   github:
     toolsets: [issues, repos]
     min-integrity: none
@@ -197,8 +203,23 @@ are already present, `cargo test` when crates are already present), run the
   wrong (Step 4's stop path).
 - If no usable test command exists, say so in the PR body rather than claiming
   verification you did not perform.
+- **Use an allow-listed interpreter.** Your sandbox only permits specific
+  commands. For Python, invoke tests as `python -m pytest <path>`,
+  `python3 -m pytest <path>`, or (when a project virtualenv exists)
+  `.venv/bin/python -m pytest <path>` — all of these are allow-listed. If a test
+  command is refused with `Permission denied and could not request permission`,
+  it is **not** on the allow-list: do not retry the same command in a loop (that
+  only burns the AI-credit budget). Switch to one of the allowed forms above, and
+  if none can run in this sandbox, record that in the PR body and move on.
 
 ## Step 6 — Open a Draft Pull Request
+
+> **Open-PR cap does not apply here.** `AGENTS.md` and `CONTRIBUTING.md` describe a
+> "three open pull requests" throttle for human-directed contributions. This
+> workflow files its draft fix PR through the `create-pull-request` safe output as
+> part of the automated pipeline, so that cap is **exempt**: always open the draft
+> PR regardless of how many open PRs the filing identity has, and never leave the
+> fix stranded on an un-pushed branch because of it.
 
 Use the `create-pull-request` safe output to open a **draft** PR with your
 changes. The harness handles branching, committing, and pushing from the working
