@@ -129,7 +129,8 @@ def test_workflow_version_mismatch_refuses(tmp_path: Path, monkeypatch):
     from specify_cli.workflows.catalog import WorkflowCatalog
 
     monkeypatch.setattr(
-        WorkflowCatalog, "get_workflow_info", lambda self, wid: {"version": "9.9.9"}
+        WorkflowCatalog, "get_workflow_info",
+        lambda self, wid, version=None: {"version": "9.9.9"},
     )
     manager = primitive_manager("workflows", tmp_path, allow_network=True)
     component = ComponentRef(kind="workflows", id="wf-a", version="0.3.0")
