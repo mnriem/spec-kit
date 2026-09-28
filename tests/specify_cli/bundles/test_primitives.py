@@ -599,6 +599,71 @@ def test_catalog_extension_install_scaffolds_config(tmp_path: Path, monkeypatch)
     assert scaffolded.read_text(encoding="utf-8") == "setting: default\n"
 
 
+@pytest.mark.parametrize("archive_version", ["1.0.0", "2.0.0"])
+def test_bundle_extension_pin_verifies_selected_archive_before_install(
+    tmp_path: Path, monkeypatch, archive_version: str,
+):
+    import zipfile
+
+    import specify_cli._assets as assets
+    from specify_cli.extensions import ExtensionCatalog
+    from specify_cli.extensions import ValidationError
+
+    if not hasattr(ExtensionCatalog, "download_extension_info"):
+        pytest.skip("exact release downloads require the extension catalog slice")
+
+    source = tmp_path / "source"
+    _write_extension_with_config(source)
+    if archive_version != "1.0.0":
+        import yaml
+
+        manifest_path = source / "extension.yml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        manifest["extension"]["version"] = archive_version
+        manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+    archive = tmp_path / "extension.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for path in source.rglob("*"):
+            if path.is_file():
+                zipped.write(path, path.relative_to(source))
+
+    monkeypatch.setattr(assets, "_locate_bundled_extension", lambda _id: None)
+    looked_up: list[str | None] = []
+    selected = {
+        "id": "my-ext", "version": "1.0.0", "sha256": "a" * 64,
+        "_install_allowed": True, "_catalog_name": "trusted",
+        "download_url": "https://example.org/my-ext-1.0.0.zip",
+    }
+
+    def lookup(_self, _id, version=None):
+        looked_up.append(version)
+        return {**selected, "version": "2.0.0"} if version is None else selected
+
+    monkeypatch.setattr(ExtensionCatalog, "get_extension_info", lookup)
+    monkeypatch.setattr(
+        ExtensionCatalog, "download_extension_info", lambda _self, info: archive,
+    )
+    monkeypatch.setattr(
+        ExtensionCatalog, "download_extension",
+        lambda _self, _id: pytest.fail("current URL was requested"),
+    )
+    root = tmp_path / "project"
+    manager = primitive_manager("extensions", root, allow_network=True)
+    pin = ComponentRef(kind="extensions", id="my-ext", version="1.0.0")
+
+    if archive_version == "1.0.0":
+        manager.install(pin)
+        assert manager._manager.registry.get("my-ext")["version"] == "1.0.0"
+    else:
+        with pytest.raises(ValidationError, match="expected 1.0.0"):
+            manager.install(pin)
+        assert not manager._manager.registry.is_installed("my-ext")
+
+    assert looked_up == [None, "1.0.0"]
+    assert not archive.exists()
+
+
 def test_bundled_preset_pin_mismatch_refuses(tmp_path: Path, monkeypatch):
     import specify_cli._assets as assets
     from specify_cli.presets import PresetManager
