@@ -728,7 +728,7 @@ def test_bundle_preset_pin_verifies_selected_archive_before_install(
         manager.install(pin)
         assert manager._manager.registry.get("sample-preset")["version"] == "1.0.0"
     else:
-        with pytest.raises(PresetValidationError, match="expected"):
+        with pytest.raises(PresetValidationError, match="does not match catalog version"):
             manager.install(pin)
         assert not manager._manager.registry.is_installed("sample-preset")
 
