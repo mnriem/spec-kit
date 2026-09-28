@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
@@ -38,3 +39,13 @@ def test_override_symlinked_specify_errors_bundle_init_no_fallback(
     assert result.exit_code != 0
     assert "symlinked .specify" in result.output
     assert not (elsewhere / ".specify").exists()
+
+
+def test_bundle_init_keeps_current_release_default(project: Path):
+    with patch("specify_cli.bundles.command_init.bundle_install") as install:
+        result = runner.invoke(app, ["bundle", "init", "demo-bundle", "--offline"])
+
+    assert result.exit_code == 0, result.output
+    install.assert_called_once_with(
+        "demo-bundle", integration=None, offline=True, version=None
+    )

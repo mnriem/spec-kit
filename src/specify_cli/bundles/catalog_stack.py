@@ -4,6 +4,7 @@ Loads each source's catalog payload (via an injectable fetcher so tests stay
 offline), then resolves a bundle id to the highest-precedence entry while
 recording whether installation is permitted by that source's policy.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -70,13 +71,16 @@ class CatalogStack:
             self._payloads[source.id] = load_catalog_payload(raw)
         return self._payloads[source.id]
 
-    def resolve(self, bundle_id: str) -> ResolvedBundle:
-        """Return the highest-precedence entry for *bundle_id* or raise."""
+    def resolve(self, bundle_id: str, version: str | None = None) -> ResolvedBundle:
+        """Select a release from the highest-precedence source for *bundle_id*."""
         for source in self._sources:
             entries = self._entries_for(source)
             entry = entries.get(bundle_id)
             if entry is not None:
-                return ResolvedBundle(entry=entry.with_provenance(source), source=source)
+                selected = entry.select_version(version)
+                return ResolvedBundle(
+                    entry=selected.with_provenance(source), source=source
+                )
         raise BundlerError(
             f"Bundle '{bundle_id}' was not found in any configured catalog."
         )

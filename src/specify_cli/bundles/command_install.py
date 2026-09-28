@@ -41,6 +41,9 @@ def bundle_install(
         "--refresh",
         help="Refresh owned components from this bundle source",
     ),
+    version: str | None = typer.Option(
+        None, "--version", help="Exact bundle release from the selected catalog"
+    ),
 ) -> None:
     """Install a bundle's full component set through each primitive's machinery.
 
@@ -59,6 +62,10 @@ def bundle_install(
 
         local_manifest = _local_manifest_source(bundle_id)
         if local_manifest is not None:
+            if version is not None:
+                raise BundlerError(
+                    "--version requires a catalog bundle id, not a local path."
+                )
             manifest = local_manifest
             _validate_manifest_structure(
                 manifest,
@@ -66,7 +73,7 @@ def bundle_install(
             )
         else:
             stack = _build_stack(project_root or Path.cwd(), offline=offline)
-            resolved = stack.resolve(bundle_id)
+            resolved = stack.resolve(bundle_id, version=version)
 
             if not resolved.install_allowed:
                 raise BundlerError(

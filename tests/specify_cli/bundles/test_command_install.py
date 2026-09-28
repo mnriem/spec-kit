@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import os
+import re
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -107,6 +110,177 @@ def test_install_refuses_discovery_only_source(project: Path, monkeypatch):
     result = runner.invoke(app, ["bundle", "install", "demo", "--offline"])
     assert result.exit_code == 1
     assert "discovery-only" in result.output
+
+
+class _BundleResponse(io.BytesIO):
+    def __init__(self, body: bytes, url: str) -> None:
+        super().__init__(body)
+        self.url = url
+
+    def geturl(self) -> str:
+        return self.url
+
+
+def _versioned_catalog(
+    project: Path, *, policy: str = "install-allowed"
+) -> tuple[str, bytes]:
+    old_manifest = valid_manifest_dict(
+        provides={"extensions": [{"id": "ext-a", "version": "7.3.0"}]}
+    )
+    old_manifest["bundle"]["version"] = "1.0.0"
+    body = yaml.safe_dump(old_manifest).encode()
+    old_url = "https://example.com/old-bundle.yml"
+    catalog = project / "versions.json"
+    write_catalog_file(
+        catalog,
+        {
+            "demo-bundle": catalog_entry_dict(
+                "demo-bundle",
+                download_url="https://example.com/current-bundle.yml",
+                releases={
+                    "1.0.0": {
+                        "download_url": old_url,
+                        "sha256": hashlib.sha256(body).hexdigest(),
+                    }
+                },
+            )
+        },
+    )
+    config = {
+        "schema_version": "1.0",
+        "catalogs": [
+            {
+                "id": "test",
+                "url": str(catalog),
+                "priority": 0,
+                "install_policy": policy,
+            }
+        ],
+    }
+    (project / ".specify" / "bundle-catalogs.yml").write_text(
+        yaml.safe_dump(config), encoding="utf-8"
+    )
+    return old_url, body
+
+
+def test_catalog_install_selects_exact_bundle_release_not_component_pins(
+    project: Path,
+    monkeypatch,
+):
+    from specify_cli.bundles.records import load_records
+
+    old_url, body = _versioned_catalog(project)
+    requested = []
+
+    def fake_open_url(url, **kwargs):
+        requested.append(url)
+        assert url == old_url
+        return _BundleResponse(body, url)
+
+    monkeypatch.setattr("specify_cli.authentication.http.open_url", fake_open_url)
+    installer = FakeInstaller()
+    monkeypatch.setattr(
+        "specify_cli.bundles.adapters.DefaultPrimitiveInstaller", lambda **kw: installer
+    )
+
+    result = runner.invoke(
+        app, ["bundle", "install", "demo-bundle", "--version", "1.0.0"]
+    )
+    assert result.exit_code == 0, result.output
+    assert requested == [old_url]
+    assert load_records(project)[0].version == "1.0.0"
+    assert load_records(project)[0].contributed_components[0].version == "7.3.0"
+    assert installer.install_calls == [("extensions", "ext-a")]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("digest", "sha256|Integrity check"),
+        ("id", "id mismatch"),
+        ("version", "version mismatch"),
+    ],
+)
+def test_catalog_install_rejects_invalid_selected_release_before_install(
+    project: Path,
+    monkeypatch,
+    change,
+    message,
+):
+    from specify_cli.bundles.records import records_path
+
+    old_url, body = _versioned_catalog(project)
+    manifest = yaml.safe_load(body)
+    if change == "id":
+        manifest["bundle"]["id"] = "different-bundle"
+    elif change == "version":
+        manifest["bundle"]["version"] = "1.1.0"
+    else:
+        manifest["bundle"]["description"] = "altered after publication"
+    changed_body = yaml.safe_dump(manifest).encode()
+    if change != "digest":
+        catalog_path = project / "versions.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["bundles"]["demo-bundle"]["releases"]["1.0.0"]["sha256"] = (
+            hashlib.sha256(changed_body).hexdigest()
+        )
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    def fake_open_url(url, **kwargs):
+        assert url == old_url
+        return _BundleResponse(changed_body, url)
+
+    monkeypatch.setattr("specify_cli.authentication.http.open_url", fake_open_url)
+    installer = FakeInstaller()
+    monkeypatch.setattr(
+        "specify_cli.bundles.adapters.DefaultPrimitiveInstaller", lambda **kw: installer
+    )
+    result = runner.invoke(
+        app, ["bundle", "install", "demo-bundle", "--version", "1.0.0"]
+    )
+    assert result.exit_code == 1, result.output
+    assert re.search(message, result.output)
+    assert installer.install_calls == []
+    assert not records_path(project).exists()
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "message"),
+    [
+        ("install", ["demo-bundle", "--version", "0.9.0"], "no release '0.9.0'"),
+        (
+            "install",
+            ["demo-bundle", "--version", "1.0.0", "--offline"],
+            "Network access disabled",
+        ),
+        ("add", ["demo-bundle", "--version", "1.0.0"], "discovery-only"),
+    ],
+)
+def test_catalog_selection_fails_without_mutation(
+    project: Path, monkeypatch, command, args, message
+):
+    from specify_cli.bundles.records import records_path
+
+    _versioned_catalog(
+        project, policy="discovery-only" if command == "add" else "install-allowed"
+    )
+    monkeypatch.setattr(
+        "specify_cli.authentication.http.open_url",
+        lambda *a, **kw: pytest.fail("A rejected release must not download"),
+    )
+    result = runner.invoke(app, ["bundle", command, *args])
+    assert result.exit_code == 1, result.output
+    assert message in result.output
+    assert not records_path(project).exists()
+
+
+def test_version_rejected_for_local_bundle_source(project: Path):
+    manifest = write_manifest(project / "local")
+    result = runner.invoke(
+        app, ["bundle", "install", str(manifest), "--version", "1.0.0", "--offline"]
+    )
+    assert result.exit_code == 1
+    assert "--version requires a catalog bundle id" in result.output
 
 
 def test_install_integration_override_cannot_bypass_clash_guard(project: Path):

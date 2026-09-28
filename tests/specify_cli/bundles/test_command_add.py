@@ -34,7 +34,15 @@ def test_add_forwards_refresh_default_without_refreshing(project: Path):
         integration=None,
         offline=False,
         refresh=False,
+        version=None,
     )
+
+
+def test_add_forwards_exact_bundle_version(project: Path):
+    with patch("specify_cli.bundles.command_add.bundle_install") as install:
+        result = runner.invoke(app, ["bundle", "add", "demo", "--version", "1.0.0"])
+    assert result.exit_code == 0, result.output
+    assert install.call_args.kwargs["version"] == "1.0.0"
 
 
 @pytest.mark.parametrize(

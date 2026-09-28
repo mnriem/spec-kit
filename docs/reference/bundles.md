@@ -48,12 +48,15 @@ Searches all active catalogs for bundles matching the query. Without a query, li
 specify bundle info <bundle_id>
 ```
 
-| Option       | Description                       |
-| ------------ | --------------------------------- |
-| `--offline`  | Do not access the network         |
-| `--json`     | Emit machine-readable JSON        |
+| Option       | Description                                                  |
+| ------------ | ------------------------------------------------------------ |
+| `--offline`  | Do not access the network                                    |
+| `--json`     | Emit machine-readable JSON                                   |
+| `--versions` | List the selected catalog's current and historical releases |
 
 Shows full metadata for a bundle along with the **fully expanded component set** it installs — every extension, preset, step, and workflow with its pinned version, plus preset priority and strategy. The output also includes a trust indicator (`verified` vs `community`) so you can judge trust before installing. This preview is the same plan `install` applies, so you can see exactly what will be added before committing. Foreseeable overlaps with components already provided by installed bundles are surfaced here as well.
+
+`--versions` additionally lists the current bundle release first and then historical releases (also as `versions` in `--json`). The component preview remains for the **current** release; listing historical releases does not download or preview their manifests. A discovery-only entry can list versions but cannot be installed from that source.
 
 ## Install a Bundle
 
@@ -66,8 +69,11 @@ specify bundle install <bundle_id | path>
 | `--integration`  | Override the integration used when initializing/installing         |
 | `--offline`      | Do not access the network                                          |
 | `--refresh`      | Refresh owned components from the supplied bundle source           |
+| `--version <v>`  | Select an exact bundle release from the winning catalog source     |
 
 Installs a bundle's full component set through each primitive's machinery. The argument may be a catalog bundle id, or a local path to a built `.zip` artifact, a bundle directory, or a `bundle.yml` file; local sources install directly without consulting the catalog stack.
+
+`specify bundle install <id> --version <v>` (or its `bundle add` alias) selects the exact bundle release advertised by the winning catalog source. This does **not** change any component pins inside that release's `bundle.yml`; component historical pin resolution is separate. `--version` is not accepted with local bundle paths. If the selected source lacks that release, installation fails rather than falling back to another source or the current release. Discovery-only sources remain non-installable. The selected release's URL, redirect chain, SHA-256 digest, and downloaded manifest ID and version are checked before installation. A historical release must provide a digest; legacy current-only entries retain their existing optional-digest behavior. `--offline` cannot download catalog-backed bundle manifests.
 
 If the current directory is not yet a Spec Kit project, `install` initializes one first so a fresh checkout reaches a working state in a single command. `--integration` selects the integration when initializing a new project, and confirms the target when a bundle pins a specific integration but the project's active integration can't be determined (missing or unreadable `.specify/integration.json`). It does **not** override an already-initialized project's active integration: if a bundle targets a different integration than the project's, install aborts with no changes. Integration-agnostic bundles inherit the project's active integration. Without `--refresh`, installation is idempotent — components already present are skipped. On failure, no provenance record is written (a failed install records nothing), and the components installed during that run are removed on a best-effort basis — removal errors are swallowed, so partial on-disk state may remain.
 
@@ -173,6 +179,31 @@ Each source has an install policy. `install-allowed` sources can be installed
 from; `discovery-only` sources appear in `search` and `info` but refuse
 installation. Inspect the active stack before installing a bundle from a
 non-default source.
+
+### Publishing historical bundle releases
+
+Existing catalogs with only top-level fields remain valid. To retain older releases, keep the current `version`, `download_url`, `sha256` (if supplied), `requires`, and `provides` at the top level for older clients, and add a `releases` mapping keyed by historical version:
+
+```json
+{
+  "id": "my-bundle",
+  "name": "My Bundle",
+  "version": "2.0.0",
+  "download_url": "https://example.com/my-bundle-2.zip",
+  "requires": {"speckit_version": ">=0.1.0"},
+  "provides": {"extensions": 1},
+  "releases": {
+    "1.0.0": {
+      "download_url": "https://example.com/my-bundle-1.zip",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requires": {"speckit_version": ">=0.1.0"},
+      "provides": {"extensions": 1}
+    }
+  }
+}
+```
+
+Each historical record needs its own HTTPS (or localhost HTTP) URL and 64-character hex SHA-256 digest; optional historical `requires`, `provides`, and `verified` fields describe **that release only**, not the current release. Shared identity and descriptive fields may be inherited or overridden. Repeated equivalent versions, inconsistent IDs, invalid requirements, and malformed release records are rejected. Release selection uses the winning source's policy and precedence; `--from` is not a bundle catalog selector. Community catalogs remain discovery-only current-tip listings.
 
 ### List the Catalog Stack
 

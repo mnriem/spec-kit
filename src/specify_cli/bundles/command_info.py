@@ -27,6 +27,9 @@ def bundle_info(
     bundle_id: str = typer.Argument(..., help="Bundle id to inspect"),
     offline: bool = typer.Option(False, "--offline", help="Do not access the network"),
     as_json: bool = typer.Option(False, "--json", help="Emit JSON to stdout"),
+    versions: bool = typer.Option(
+        False, "--versions", help="Show current and historical catalog releases"
+    ),
 ) -> None:
     """Show full metadata and the fully expanded component set (== what install adds)."""
     try:
@@ -71,6 +74,8 @@ def bundle_info(
             "components": components,
             "overlaps": overlaps,
         }
+        if versions:
+            payload["versions"] = entry.available_versions
         print(_json.dumps(payload, indent=2))
         return
 
@@ -90,6 +95,11 @@ def bundle_info(
         f"({resolved.source.install_policy.value})"
     )
     console.print(f"  Trust: {_trust_badge(entry.verified)}")
+    if versions:
+        console.print(
+            "  Versions (current first): "
+            + _escape_markup(", ".join(entry.available_versions))
+        )
     if entry.requires_speckit_version:
         console.print(
             f"  Requires Spec Kit: "

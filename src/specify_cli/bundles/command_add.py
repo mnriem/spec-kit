@@ -22,6 +22,9 @@ def bundle_add(
         "--refresh",
         help="Refresh owned components from this bundle source",
     ),
+    version: str | None = typer.Option(
+        None, "--version", help="Exact bundle release from the selected catalog"
+    ),
 ) -> None:
     """Install a bundle's full component set (alias for install)."""
     bundle_install(
@@ -29,4 +32,5 @@ def bundle_add(
         integration=integration,
         offline=offline,
         refresh=refresh,
+        version=version,
     )

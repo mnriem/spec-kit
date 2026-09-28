@@ -274,6 +274,71 @@ def test_download_manifest_accepts_matching_sha256(monkeypatch):
     assert manifest.bundle.id == "demo-bundle"
 
 
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("hash", "sha256|Integrity check"),
+        ("id", "id mismatch"),
+        ("version", "version mismatch"),
+    ],
+)
+def test_selected_historical_release_checks_its_own_digest_and_identity(
+    monkeypatch, change, message
+):
+    data = valid_manifest_dict()
+    data["bundle"]["version"] = "1.0.0"
+    if change == "id":
+        data["bundle"]["id"] = "other-bundle"
+    elif change == "version":
+        data["bundle"]["version"] = "2.0.0"
+    body = yaml.safe_dump(data).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    entry = CatalogEntry.from_dict(
+        catalog_entry_dict(
+            "demo-bundle",
+            version="3.0.0",
+            download_url="https://example.com/current.yml",
+            sha256="0" * 64,
+            releases={
+                "1.0.0": {
+                    "download_url": "https://example.com/historical.yml",
+                    "sha256": "f" * 64 if change == "hash" else digest,
+                }
+            },
+        )
+    )
+    _patch_download(monkeypatch, body)
+
+    with pytest.raises(BundlerError, match=message):
+        _download_manifest(
+            SimpleNamespace(entry=entry.select_version("1.0.0")), offline=False
+        )
+
+
+def test_selected_historical_release_rejects_insecure_redirect(monkeypatch):
+    entry = CatalogEntry.from_dict(
+        catalog_entry_dict(
+            "demo-bundle",
+            releases={
+                "1.0.0": {
+                    "download_url": "https://example.com/historical.yml",
+                    "sha256": "a" * 64,
+                }
+            },
+        )
+    )
+
+    def insecure_redirect(url, *, redirect_validator, **kwargs):
+        redirect_validator(url, "http://other.example/historical.yml")
+        pytest.fail("Insecure redirect must be rejected before reading a response")
+
+    monkeypatch.setattr("specify_cli.authentication.http.open_url", insecure_redirect)
+    with pytest.raises(BundlerError, match="non-HTTPS"):
+        _download_manifest(
+            SimpleNamespace(entry=entry.select_version("1.0.0")), offline=False
+        )
+
+
 def test_download_manifest_accepts_legacy_entry_without_sha256(monkeypatch):
     body = yaml.safe_dump(valid_manifest_dict()).encode()
     _patch_download(monkeypatch, body)

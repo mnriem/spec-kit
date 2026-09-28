@@ -4,14 +4,18 @@ Mirrors ``contracts/bundle-catalog.schema.md``. The stack precedence is
 project > user > built-in; install is permitted only from ``install-allowed``
 sources.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Any
 
 from . import BundlerError
+from .sources import _require_https
+from .versioning import parse_constraint, parse_version
 from .yamlio import ensure_within, load_yaml
 
 CONFIG_FILENAME = "bundle-catalogs.yml"
@@ -21,6 +25,21 @@ CONFIG_FILENAME = "bundle-catalogs.yml"
 # Spec Kit fails fast instead of being parsed under the wrong assumptions.
 CONFIG_SCHEMA_VERSION = "1.0"
 CATALOG_SCHEMA_VERSION = "1.0"
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_CURRENT_RELEASE_FIELDS = frozenset(
+    {
+        "version",
+        "download_url",
+        "sha256",
+        "requires",
+        "provides",
+        "verified",
+        "releases",
+    }
+)
+_RESERVED_RELEASE_FIELDS = frozenset(
+    {"id", "version", "releases", "source_id", "source_policy"}
+)
 
 
 class InstallPolicy(str, Enum):
@@ -47,10 +66,18 @@ class Scope(str, Enum):
 
 # Built-in default stack (used when no project/user config overrides it).
 BUILTIN_DEFAULT_STACK: tuple[dict[str, Any], ...] = (
-    {"id": "default", "url": "builtin://default", "priority": 1,
-     "install_policy": InstallPolicy.INSTALL_ALLOWED.value},
-    {"id": "community", "url": "builtin://community", "priority": 20,
-     "install_policy": InstallPolicy.DISCOVERY_ONLY.value},
+    {
+        "id": "default",
+        "url": "builtin://default",
+        "priority": 1,
+        "install_policy": InstallPolicy.INSTALL_ALLOWED.value,
+    },
+    {
+        "id": "community",
+        "url": "builtin://community",
+        "priority": 20,
+        "install_policy": InstallPolicy.DISCOVERY_ONLY.value,
+    },
 )
 
 
@@ -78,7 +105,9 @@ class CatalogSource:
             raise BundlerError(f"Catalog source '{source_id}' is missing its 'url'.")
         priority = data.get("priority")
         if priority is None:
-            raise BundlerError(f"Catalog source '{source_id}' is missing its 'priority'.")
+            raise BundlerError(
+                f"Catalog source '{source_id}' is missing its 'priority'."
+            )
         if isinstance(priority, bool) or not isinstance(priority, (int, str)):
             raise BundlerError(
                 f"Catalog source '{source_id}' has a non-integer priority: {priority!r}."
@@ -158,6 +187,7 @@ class CatalogEntry:
     # Resolution provenance (filled in by the catalog stack at lookup time):
     source_id: str | None = None
     source_policy: InstallPolicy | None = None
+    releases: tuple[CatalogEntry, ...] = ()
 
     @classmethod
     def from_dict(cls, data: Any) -> "CatalogEntry":
@@ -183,7 +213,7 @@ class CatalogEntry:
                 f"Catalog entry '{entry_id or '<unknown>'}': 'provides' must be a "
                 "mapping when present."
             )
-        return cls(
+        entry = cls(
             id=entry_id,
             name=str(data.get("name", "")).strip(),
             version=str(data.get("version", "")).strip(),
@@ -194,27 +224,123 @@ class CatalogEntry:
             download_url=str(data.get("download_url", "")).strip(),
             requires_speckit_version=str(requires.get("speckit_version", "")).strip(),
             sha256=(
-                None
-                if data.get("sha256") is None
-                else str(data["sha256"]).strip()
+                None if data.get("sha256") is None else str(data["sha256"]).strip()
             ),
             provides=dict(provides_raw),
             repository=(str(data["repository"]) if data.get("repository") else None),
             tags=_parse_tags(data.get("tags"), entry_id),
             verified=_parse_verified(data.get("verified", False), entry_id),
         )
+        if "releases" not in data:
+            return entry
+        releases = data["releases"]
+        if not isinstance(releases, dict):
+            raise BundlerError(
+                f"Catalog entry '{entry_id}': 'releases' must be a mapping."
+            )
+        if not entry.version:
+            raise BundlerError(
+                f"Catalog entry '{entry_id}' has releases but no current version."
+            )
+        seen = {parse_version(entry.version)}
+        historical: list[CatalogEntry] = []
+        shared = {
+            key: value
+            for key, value in data.items()
+            if key not in _CURRENT_RELEASE_FIELDS
+        }
+        for release_version, record in releases.items():
+            if not isinstance(release_version, str) or not release_version.strip():
+                raise BundlerError(
+                    f"Catalog entry '{entry_id}' has an invalid release version key."
+                )
+            normalized = parse_version(release_version)
+            if normalized in seen:
+                raise BundlerError(
+                    f"Catalog entry '{entry_id}' repeats release version '{release_version}'."
+                )
+            seen.add(normalized)
+            if not isinstance(record, dict):
+                raise BundlerError(
+                    f"Catalog entry '{entry_id}' release '{release_version}' must be a mapping."
+                )
+            if _RESERVED_RELEASE_FIELDS.intersection(record):
+                raise BundlerError(
+                    f"Catalog entry '{entry_id}' release '{release_version}' contains reserved fields."
+                )
+            if (
+                not isinstance(record.get("download_url"), str)
+                or not record["download_url"].strip()
+            ):
+                raise BundlerError(
+                    f"Catalog entry '{entry_id}' release '{release_version}' needs a download_url."
+                )
+            _require_https(
+                f"bundle '{entry_id}' release '{release_version}'",
+                record["download_url"],
+            )
+            if not isinstance(record.get("sha256"), str) or not _SHA256.fullmatch(
+                record["sha256"]
+            ):
+                raise BundlerError(
+                    f"Catalog entry '{entry_id}' release '{release_version}' needs a SHA-256 digest."
+                )
+            if "requires" in record:
+                requirements = record["requires"]
+                if not isinstance(requirements, dict):
+                    raise BundlerError(
+                        f"Catalog entry '{entry_id}' release '{release_version}' has invalid requires."
+                    )
+                if "speckit_version" in requirements:
+                    speckit_version = requirements["speckit_version"]
+                    if (
+                        not isinstance(speckit_version, str)
+                        or not speckit_version.strip()
+                    ):
+                        raise BundlerError(
+                            f"Catalog entry '{entry_id}' release '{release_version}' has invalid requires.speckit_version."
+                        )
+                    parse_constraint(speckit_version)
+            historical.append(
+                cls.from_dict(
+                    {**shared, **record, "id": entry_id, "version": release_version}
+                )
+            )
+        return replace(entry, releases=tuple(historical))
+
+    @property
+    def available_versions(self) -> list[str]:
+        """Advertised current release first, then historical releases newest first."""
+        if not self.version:
+            return []
+        return [
+            self.version,
+            *(
+                release.version
+                for release in sorted(
+                    self.releases,
+                    key=lambda release: parse_version(release.version),
+                    reverse=True,
+                )
+            ),
+        ]
+
+    def select_version(self, version: str | None) -> "CatalogEntry":
+        """Select a release from this entry only; never consult shadowed sources."""
+        if version is None or version == self.version:
+            return self
+        requested = parse_version(version)
+        if self.version and requested == parse_version(self.version):
+            return self
+        for release in self.releases:
+            if requested == parse_version(release.version):
+                return release
+        raise BundlerError(
+            f"Bundle '{self.id}' has no release '{version}' in the selected catalog source."
+        )
 
     def with_provenance(self, source: CatalogSource) -> "CatalogEntry":
-        return CatalogEntry(
-            id=self.id, name=self.name, version=self.version, role=self.role,
-            description=self.description, author=self.author, license=self.license,
-            download_url=self.download_url,
-            requires_speckit_version=self.requires_speckit_version,
-            sha256=self.sha256,
-            provides=self.provides, repository=self.repository, tags=self.tags,
-            verified=self.verified, source_id=source.id,
-            source_policy=source.install_policy,
-        )
+        return replace(self, source_id=source.id, source_policy=source.install_policy)
 
 
 def load_catalog_payload(data: Any) -> dict[str, CatalogEntry]:
@@ -243,19 +369,18 @@ def load_catalog_payload(data: Any) -> dict[str, CatalogEntry]:
         # disagrees with the key, so a malformed or malicious catalog can't list
         # an id that resolves to a different (or no) bundle.
         if not entry.id:
-            raise BundlerError(
-                f"Catalog entry for '{key}' is missing its 'id' field."
-            )
+            raise BundlerError(f"Catalog entry for '{key}' is missing its 'id' field.")
         if entry.id != key:
             raise BundlerError(
-                f"Catalog entry id mismatch: key '{key}' != entry id "
-                f"'{entry.id}'."
+                f"Catalog entry id mismatch: key '{key}' != entry id '{entry.id}'."
             )
         entries[key] = entry
     return entries
 
 
-def load_source_stack(project_root: Path, user_config_dir: Path | None = None) -> list[CatalogSource]:
+def load_source_stack(
+    project_root: Path, user_config_dir: Path | None = None
+) -> list[CatalogSource]:
     """Build the effective, priority-sorted source stack (project > user > built-in).
 
     A source id present at a higher-precedence scope overrides the same id at a
@@ -281,7 +406,9 @@ def load_source_stack(project_root: Path, user_config_dir: Path | None = None) -
     return sorted(by_id.values(), key=lambda s: (s.priority, s.id))
 
 
-def _merge_config(by_id: dict[str, CatalogSource], config_path: Path, scope: Scope) -> None:
+def _merge_config(
+    by_id: dict[str, CatalogSource], config_path: Path, scope: Scope
+) -> None:
     if not config_path.exists():
         return
     # ``load_yaml`` returns ``{}`` only for an empty document and the raw parse
@@ -303,8 +430,7 @@ def _merge_config(by_id: dict[str, CatalogSource], config_path: Path, scope: Sco
     # valid (backward compatible with configs that omit it).
     schema_version = data.get("schema_version")
     if schema_version is not None and (
-        str(schema_version).strip().split(".")[0]
-        != CONFIG_SCHEMA_VERSION.split(".")[0]
+        str(schema_version).strip().split(".")[0] != CONFIG_SCHEMA_VERSION.split(".")[0]
     ):
         raise BundlerError(
             f"Unsupported catalog config schema version "

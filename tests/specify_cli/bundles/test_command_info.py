@@ -106,6 +106,49 @@ def test_info_expands_full_component_set(project: Path, monkeypatch):
     assert "Trust" in text.output
 
 
+def test_info_versions_preserves_current_preview(project: Path, monkeypatch):
+    bundle_dir = project / "src-bundle"
+    manifest_path = bundle_dir / "bundle.yml"
+    bundle_dir.mkdir()
+    manifest_path.write_text(yaml.safe_dump(valid_manifest_dict()), encoding="utf-8")
+    catalog = project / "versions.json"
+    write_catalog_file(
+        catalog,
+        {
+            "demo-bundle": catalog_entry_dict(
+                "demo-bundle",
+                download_url="https://example.com/current.zip",
+                releases={
+                    "1.0.0": {
+                        "download_url": "https://example.com/old.zip",
+                        "sha256": "a" * 64,
+                    }
+                },
+            ),
+        },
+    )
+    _make_catalog_config(catalog, project)
+    _mock_manifest_download(monkeypatch, manifest_path)
+
+    default = runner.invoke(
+        app, ["bundle", "info", "demo-bundle", "--json", "--offline"]
+    )
+    selected = runner.invoke(
+        app, ["bundle", "info", "demo-bundle", "--versions", "--json", "--offline"]
+    )
+    text = runner.invoke(
+        app, ["bundle", "info", "demo-bundle", "--versions", "--offline"]
+    )
+
+    assert default.exit_code == selected.exit_code == text.exit_code == 0
+    assert "versions" not in json.loads(default.output)
+    payload = json.loads(selected.output)
+    assert payload["version"] == "1.2.0"
+    assert payload["versions"] == ["1.2.0", "1.0.0"]
+    assert payload["components"] == json.loads(default.output)["components"]
+    assert "Versions (current first): 1.2.0, 1.0.0" in text.output
+
+
 def test_info_escapes_catalog_markup(project: Path, monkeypatch):
     entry = _configure_markup_catalog(project)
     bundle_dir = project / "markup-bundle"
