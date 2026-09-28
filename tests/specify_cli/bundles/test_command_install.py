@@ -398,9 +398,19 @@ def test_local_refresh_catalog_extension_requires_network(
     monkeypatch.setattr(
         ExtensionCatalog,
         "get_extension_info",
-        lambda self, cid: {"id": cid, "version": version, "_install_allowed": True},
+        lambda self, cid, selected_version=None: {
+            "id": cid,
+            "version": version,
+            "_install_allowed": True,
+        },
     )
     monkeypatch.setattr(ExtensionCatalog, "download_extension", download_extension)
+    if hasattr(ExtensionCatalog, "download_extension_info"):
+        monkeypatch.setattr(
+            ExtensionCatalog,
+            "download_extension_info",
+            lambda self, info: download_extension(self, info["id"]),
+        )
     data = valid_manifest_dict(
         provides={"extensions": [{"id": "catalog-ext", "version": version}]}
     )

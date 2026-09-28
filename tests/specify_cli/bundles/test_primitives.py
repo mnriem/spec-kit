@@ -174,13 +174,17 @@ def test_catalog_preset_install_and_refresh_forward_catalog_name(
     monkeypatch.setattr(
         PresetCatalog,
         "get_pack_info",
-        lambda _self, _id: {
+        lambda _self, _id, version=None: {
             "version": "1.0.0",
             "_install_allowed": True,
             "_catalog_name": "bundle-preset-catalog",
         },
     )
     monkeypatch.setattr(PresetCatalog, "download_pack", lambda _self, _id: archive)
+    if hasattr(PresetCatalog, "download_pack_info"):
+        monkeypatch.setattr(
+            PresetCatalog, "download_pack_info", lambda _self, _info: archive,
+        )
 
     manager = primitive_manager("presets", tmp_path, allow_network=True)
     manager._manager = _FakeManager()
@@ -219,7 +223,7 @@ def test_catalog_extension_install_and_refresh_forward_catalog_and_scaffolding(
     monkeypatch.setattr(
         ExtensionCatalog,
         "get_extension_info",
-        lambda _self, _id: {
+        lambda _self, _id, version=None: {
             "version": "1.0.0",
             "_install_allowed": True,
             "_catalog_name": "bundle-extension-catalog",
@@ -228,6 +232,10 @@ def test_catalog_extension_install_and_refresh_forward_catalog_and_scaffolding(
     monkeypatch.setattr(
         ExtensionCatalog, "download_extension", lambda _self, _id: archive
     )
+    if hasattr(ExtensionCatalog, "download_extension_info"):
+        monkeypatch.setattr(
+            ExtensionCatalog, "download_extension_info", lambda _self, _info: archive,
+        )
 
     manager = primitive_manager("extensions", tmp_path, allow_network=True)
     manager._manager = _FakeManager()
