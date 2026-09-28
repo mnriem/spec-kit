@@ -246,6 +246,214 @@ def test_catalog_extension_install_and_refresh_forward_catalog_and_scaffolding(
     assert scaffolded == ["catalog-extension", "catalog-extension"]
 
 
+@pytest.mark.parametrize("kind", ["extensions", "presets"])
+def test_pinned_historical_release_downloads_selected_record(
+    tmp_path: Path, monkeypatch, kind: str
+):
+    import specify_cli._assets as assets
+    from specify_cli.extensions import ExtensionCatalog
+    from specify_cli.presets import PresetCatalog
+
+    catalog_type = ExtensionCatalog if kind == "extensions" else PresetCatalog
+    info_method = "get_extension_info" if kind == "extensions" else "get_pack_info"
+    selected_download = (
+        "download_extension_info" if kind == "extensions" else "download_pack_info"
+    )
+    legacy_download = "download_extension" if kind == "extensions" else "download_pack"
+    monkeypatch.setattr(
+        assets,
+        "_locate_bundled_extension" if kind == "extensions" else "_locate_bundled_preset",
+        lambda _id: None,
+    )
+    current = {
+        "id": "old-component", "version": "2.0.0", "_install_allowed": True,
+        "_catalog_name": "trusted", "download_url": "https://example.org/v2.zip",
+    }
+    historical = {
+        **current, "version": "1.0.0",
+        "download_url": "https://example.org/v1.zip", "sha256": "a" * 64,
+    }
+    lookups: list[str | None] = []
+    downloads: list[dict] = []
+    installs: list[dict] = []
+    archive = tmp_path / "old-component.zip"
+    archive.write_bytes(b"archive")
+
+    def get_info(_self, _id, version=None):
+        lookups.append(version)
+        return current if version is None else historical
+
+    monkeypatch.setattr(catalog_type, info_method, get_info)
+    monkeypatch.setattr(
+        catalog_type, selected_download,
+        lambda _self, selected: downloads.append(selected) or archive,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        catalog_type, legacy_download,
+        lambda _self, _id: pytest.fail("re-lookup of current release"),
+    )
+
+    class FakeManager:
+        def install_from_zip(self, *args, **kwargs):
+            installs.append(kwargs)
+            return SimpleNamespace(id="old-component")
+
+        def scaffold_config(self, _id):
+            pass
+
+    manager = primitive_manager(kind, tmp_path, allow_network=True)
+    manager._manager = FakeManager()
+    manager.install(
+        ComponentRef(kind=kind, id="old-component", version="1.0.0", source="trusted")
+    )
+
+    assert lookups == [None, "1.0.0"]
+    assert downloads == [historical]
+    assert installs[0]["expected_id"] == "old-component"
+    assert installs[0]["expected_version"] == "1.0.0"
+    assert not archive.exists()
+
+
+@pytest.mark.parametrize("kind", ["extensions", "presets"])
+def test_missing_pinned_release_never_downloads_current(
+    tmp_path: Path, monkeypatch, kind: str
+):
+    import specify_cli._assets as assets
+    from specify_cli.extensions import ExtensionCatalog
+    from specify_cli.presets import PresetCatalog
+
+    catalog_type = ExtensionCatalog if kind == "extensions" else PresetCatalog
+    info_method = "get_extension_info" if kind == "extensions" else "get_pack_info"
+    selected_download = (
+        "download_extension_info" if kind == "extensions" else "download_pack_info"
+    )
+    monkeypatch.setattr(
+        assets,
+        "_locate_bundled_extension" if kind == "extensions" else "_locate_bundled_preset",
+        lambda _id: None,
+    )
+    monkeypatch.setattr(
+        catalog_type, info_method,
+        lambda _self, _id, version=None: (
+            {"id": "x", "version": "2.0.0", "_install_allowed": True,
+             "_catalog_name": "trusted"} if version is None else None
+        ),
+    )
+    monkeypatch.setattr(
+        catalog_type, selected_download,
+        lambda _self, _info: pytest.fail("unexpected historical download"),
+        raising=False,
+    )
+    manager = primitive_manager(kind, tmp_path)
+    with pytest.raises(BundlerError, match="no catalog release for pinned version"):
+        manager.install(ComponentRef(kind=kind, id="x", version="1.0.0"))
+
+    with pytest.raises(BundlerError, match="cannot bypass catalog precedence"):
+        manager.install(
+            ComponentRef(kind=kind, id="x", version="1.0.0", source="lower-priority")
+        )
+
+
+@pytest.mark.parametrize("kind", ["extensions", "presets"])
+def test_discovery_only_winner_cannot_supply_pinned_release(
+    tmp_path: Path, monkeypatch, kind: str,
+):
+    import specify_cli._assets as assets
+    from specify_cli.extensions import ExtensionCatalog
+    from specify_cli.presets import PresetCatalog
+
+    catalog_type = ExtensionCatalog if kind == "extensions" else PresetCatalog
+    info_method = "get_extension_info" if kind == "extensions" else "get_pack_info"
+    selected_download = (
+        "download_extension_info" if kind == "extensions" else "download_pack_info"
+    )
+    monkeypatch.setattr(
+        assets,
+        "_locate_bundled_extension" if kind == "extensions" else "_locate_bundled_preset",
+        lambda _id: None,
+    )
+    lookups: list[str | None] = []
+
+    def lookup(_self, _id, version=None):
+        lookups.append(version)
+        return {
+            "id": "x", "version": "2.0.0", "_install_allowed": False,
+            "_catalog_name": "community",
+        }
+
+    monkeypatch.setattr(catalog_type, info_method, lookup)
+    monkeypatch.setattr(
+        catalog_type, selected_download,
+        lambda _self, _info: pytest.fail("discovery-only artifact downloaded"),
+        raising=False,
+    )
+
+    manager = primitive_manager(kind, tmp_path)
+    with pytest.raises(BundlerError, match="discovery-only"):
+        manager.install(ComponentRef(kind=kind, id="x", version="1.0.0"))
+
+    assert lookups == [None]
+
+
+def test_workflow_pin_is_forwarded_to_exact_catalog_install(tmp_path: Path, monkeypatch):
+    import specify_cli
+    import specify_cli._assets as assets
+    from specify_cli.workflows.catalog import WorkflowCatalog
+    from specify_cli.workflows import command_add
+
+    monkeypatch.setattr(assets, "_locate_bundled_workflow", lambda _id: None)
+    selected = {"id": "wf", "version": "1.0.0", "_install_allowed": True,
+                "_catalog_name": "trusted"}
+    lookups: list[str | None] = []
+    installs: list[tuple[str, str | None]] = []
+
+    def lookup(_self, _id, version=None):
+        lookups.append(version)
+        return {**selected, "version": "2.0.0"} if version is None else selected
+
+    def add(source, dev=False, from_url=None, version=None):
+        installs.append((source, version))
+
+    monkeypatch.setattr(WorkflowCatalog, "get_workflow_info", lookup)
+    monkeypatch.setattr(command_add, "workflow_add", add)
+    monkeypatch.setattr(specify_cli, "workflow_add", add)
+
+    manager = primitive_manager("workflows", tmp_path)
+    manager.install(ComponentRef(kind="workflows", id="wf", version="1.0.0"))
+
+    assert lookups == [None, "1.0.0"]
+    assert installs == [("wf", "1.0.0")]
+
+
+def test_step_pin_is_forwarded_to_exact_catalog_install(tmp_path: Path, monkeypatch):
+    import specify_cli
+    from specify_cli.workflows.step.catalog import StepCatalog
+    from specify_cli.workflows.step import command_add
+
+    selected = {"id": "step-x", "version": "1.0.0", "_install_allowed": True,
+                "_catalog_name": "trusted"}
+    lookups: list[str | None] = []
+    installs: list[tuple[str, str | None]] = []
+
+    def lookup(_self, _id, version=None):
+        lookups.append(version)
+        return {**selected, "version": "2.0.0"} if version is None else selected
+
+    def add(step_id, version=None):
+        installs.append((step_id, version))
+
+    monkeypatch.setattr(StepCatalog, "get_step_info", lookup)
+    monkeypatch.setattr(command_add, "workflow_step_add", add)
+    monkeypatch.setattr(specify_cli, "workflow_step_add", add)
+
+    manager = primitive_manager("steps", tmp_path)
+    manager.install(ComponentRef(kind="steps", id="step-x", version="1.0.0"))
+
+    assert lookups == [None, "1.0.0"]
+    assert installs == [("step-x", "1.0.0")]
+
+
 def _write_manifest(path: Path, root_key: str, version: str) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     (path / f"{root_key}.yml").write_text(

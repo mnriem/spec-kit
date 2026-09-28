@@ -77,22 +77,22 @@ def install_bundle(
     config (e.g. preset priority overrides) is preserved by the underlying
     machinery.
 
-    Version-pin enforcement is install-time only. The primitive ``is_installed``
-    checks are id-based (they do not compare versions), so when a component is
-    already present and *refresh* is False it is skipped without verifying that
-    the on-disk version matches the manifest pin. Changes to a recorded bundle's
-    version or owned component metadata, including removals, are rejected unless
-    *refresh* is True, preventing stale or orphaned components. Pins are only
-    guaranteed to be applied when the bundler actually performs an install or a
-    refresh; running ``specify bundle update`` re-applies every owned component
-    at its pinned version.
+    A component already installed at a different version cannot satisfy a pin.
+    Changes to a recorded bundle's version or owned component metadata, including
+    removals, are rejected unless *refresh* is True. Refresh may re-apply this
+    bundle's own components, but cannot replace a version required by another bundle.
     """
     records = load_records(project_root)
 
     if manifest is not None:
         report = detect_conflicts(manifest, plan.effective_integration, records)
         if report.has_blocking_conflict:
-            raise BundlerError(report.integration_clash)
+            raise BundlerError(
+                "; ".join(
+                    [*([report.integration_clash] if report.integration_clash else []),
+                     *report.version_clashes]
+                )
+            )
 
     result = InstallResult(bundle_id=plan.bundle_id)
     existing = find_record(records, plan.bundle_id)
@@ -140,6 +140,25 @@ def install_bundle(
                 # ``bundle update`` cannot make collateral changes to things it
                 # does not own (FR-022).
                 owned = key in prior_ours or key in other_tracked
+                installed_version = getattr(installer, "installed_version", None)
+                if component.version and callable(installed_version):
+                    actual = installed_version(project_root, component)
+                    from .versioning import parse_version
+
+                    if not isinstance(actual, str) or not actual.strip():
+                        raise BundlerError(
+                            f"Cannot verify installed {component.kind[:-1]} "
+                            f"'{component.id}' against pinned version "
+                            f"{component.version}."
+                        )
+                    if parse_version(actual) != parse_version(component.version):
+                        if not (refresh and key in prior_ours and key not in other_tracked):
+                            raise BundlerError(
+                                f"{component.kind[:-1]} '{component.id}' is installed "
+                                f"at version {actual}, but bundle '{plan.bundle_id}' "
+                                f"requires {component.version}. Only one version can "
+                                "be installed per ID."
+                            )
                 if refresh and owned:
                     _refresh_component(project_root, installer, component)
                     result.refreshed.append(component)

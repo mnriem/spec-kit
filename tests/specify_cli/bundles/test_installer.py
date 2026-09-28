@@ -51,6 +51,44 @@ def test_install_is_idempotent(tmp_path: Path):
     assert len(load_records(tmp_path)) == 1
 
 
+def test_second_bundle_cannot_claim_different_component_version(tmp_path: Path):
+    make_project(tmp_path)
+    installer = FakeInstaller()
+    first_data = valid_manifest_dict()
+    first_data["bundle"]["id"] = "first"
+    first_data["provides"] = {"extensions": [{"id": "ext-a", "version": "1.0.0"}]}
+    first = BundleManifest.from_dict(first_data)
+    install_bundle(tmp_path, _plan(first), installer, manifest=first)
+
+    second_data = valid_manifest_dict()
+    second_data["bundle"]["id"] = "second"
+    second_data["provides"] = {"extensions": [{"id": "ext-a", "version": "2.0.0"}]}
+    second = BundleManifest.from_dict(second_data)
+    with pytest.raises(BundlerError, match="Only one version can be installed"):
+        install_bundle(tmp_path, _plan(second), installer, manifest=second)
+
+    assert [record.bundle_id for record in load_records(tmp_path)] == ["first"]
+    assert installer.install_calls == [("extensions", "ext-a")]
+
+
+def test_installed_unowned_component_at_different_version_is_not_skipped(tmp_path: Path):
+    make_project(tmp_path)
+    manifest = BundleManifest.from_dict(valid_manifest_dict())
+
+    class VersionedInstaller(FakeInstaller):
+        def installed_version(self, project_root, component):
+            return "2.0.0"
+
+    installer = VersionedInstaller()
+    installer.installed.add(("extensions", "ext-a"))
+
+    with pytest.raises(BundlerError, match="installed at version 2.0.0"):
+        install_bundle(tmp_path, _plan(manifest), installer, manifest=manifest)
+
+    assert installer.install_calls == []
+    assert load_records(tmp_path) == []
+
+
 def test_install_rejects_version_change_without_refresh(tmp_path: Path):
     """A normal install must not advance a record past stale components.
 

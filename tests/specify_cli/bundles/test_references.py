@@ -9,18 +9,20 @@ from pathlib import Path
 
 from specify_cli.bundles.manifest import ComponentRef
 from specify_cli.bundles.references import make_reference_checker
-from tests.specify_cli.bundles.helpers import make_project
+from tests.specify_cli.bundles.helpers import bundled_extension_version, make_project
 
 
-def _ref(kind: str, id_: str) -> ComponentRef:
-    return ComponentRef(kind=kind, id=id_, version="1.0.0")
+def _ref(kind: str, id_: str, version: str | None = "1.0.0") -> ComponentRef:
+    return ComponentRef(kind=kind, id=id_, version=version)
 
 
 def test_bundled_extension_resolves(tmp_path: Path):
     root = make_project(tmp_path)
     warnings: list[str] = []
     check = make_reference_checker(root, allow_network=True, warnings=warnings)
-    assert check(_ref("extensions", "agent-context")) is None
+    assert check(
+        _ref("extensions", "agent-context", bundled_extension_version("agent-context"))
+    ) is None
     assert warnings == []
 
 
@@ -42,9 +44,30 @@ def test_builtin_step_type_resolves(tmp_path: Path):
 
     for step_id in ("shell", "gate", "command", "if", "slot"):
         assert step_id in BUILTIN_STEP_TYPES, step_id
-        assert check(_ref("steps", step_id)) is None, step_id
+        assert check(_ref("steps", step_id, version=None)) is None, step_id
     assert warnings == []
 
+
+def test_bundled_extension_at_wrong_version_does_not_validate(tmp_path: Path):
+    root = make_project(tmp_path)
+    warnings: list[str] = []
+    check = make_reference_checker(root, allow_network=True, warnings=warnings)
+
+    problem = check(_ref("extensions", "agent-context", "999.0.0"))
+
+    assert problem is not None
+    assert "999.0.0" in problem
+
+
+def test_builtin_step_cannot_verify_an_unavailable_pin(tmp_path: Path):
+    root = make_project(tmp_path)
+    warnings: list[str] = []
+    check = make_reference_checker(root, allow_network=True, warnings=warnings)
+
+    problem = check(_ref("steps", "shell", "999.0.0"))
+
+    assert problem is not None
+    assert "999.0.0" in problem
 
 def test_community_step_is_not_treated_as_bundled(tmp_path: Path):
     """A community step loaded for one project must not resolve for another.
@@ -110,3 +133,47 @@ def test_unknown_reference_warns_offline(tmp_path: Path):
     check = make_reference_checker(root, allow_network=False, warnings=warnings)
     assert check(_ref("presets", "does-not-exist")) is None
     assert any("does-not-exist" in w for w in warnings)
+
+
+def test_online_validation_checks_exact_catalog_version(tmp_path: Path, monkeypatch):
+    from specify_cli.extensions import ExtensionCatalog
+    import specify_cli._assets as assets
+
+    root = make_project(tmp_path)
+    monkeypatch.setattr(assets, "_locate_bundled_extension", lambda _id: None)
+    lookups: list[str | None] = []
+
+    def lookup(_self, _id, version=None):
+        lookups.append(version)
+        if version is None:
+            return {"version": "2.0.0", "_install_allowed": True}
+        return None
+
+    monkeypatch.setattr(ExtensionCatalog, "get_extension_info", lookup)
+    warnings: list[str] = []
+    check = make_reference_checker(root, allow_network=True, warnings=warnings)
+
+    assert "1.0.0" in check(_ref("extensions", "catalog-extension", "1.0.0"))
+    assert lookups == [None, "1.0.0"]
+    assert warnings == []
+
+
+def test_online_validation_does_not_trust_discovery_only_source(
+    tmp_path: Path, monkeypatch,
+):
+    from specify_cli.extensions import ExtensionCatalog
+    import specify_cli._assets as assets
+
+    root = make_project(tmp_path)
+    monkeypatch.setattr(assets, "_locate_bundled_extension", lambda _id: None)
+    monkeypatch.setattr(
+        ExtensionCatalog, "get_extension_info",
+        lambda _self, _id: {
+            "version": "1.0.0", "_install_allowed": False, "_catalog_name": "community"
+        },
+    )
+    warnings: list[str] = []
+    check = make_reference_checker(root, allow_network=True, warnings=warnings)
+
+    assert check(_ref("extensions", "catalog-extension")) is not None
+    assert warnings == []

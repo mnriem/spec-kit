@@ -20,12 +20,14 @@ Routing strategy per kind:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Callable, Protocol
 
 from . import BundlerError
 from .manifest import ComponentRef
+from .versioning import parse_version
 
 DEFAULT_PRIORITY = 10
 
@@ -46,8 +48,6 @@ def _assert_pinned_version(
     actual = str(advertised).strip()
     if not actual:
         return
-    from .versioning import parse_version
-
     try:
         matches = parse_version(actual) == parse_version(pinned)
     except BundlerError:
@@ -84,8 +84,93 @@ def _bundled_manifest_version(manifest_path: Path, root_key: str) -> str | None:
     return None
 
 
+def _selected_catalog_info(
+    component: ComponentRef,
+    kind: str,
+    get_info: Callable[..., dict[str, Any] | None],
+    *,
+    supports_selected_download: bool,
+) -> dict[str, Any]:
+    """Resolve a pin within the winning source, without changing its priority."""
+    current = get_info(component.id)
+    if current is None:
+        raise BundlerError(f"{kind} '{component.id}' not found in any catalog.")
+    if component.source and component.source != current.get("_catalog_name"):
+        raise BundlerError(
+            f"{kind} '{component.id}' requests catalog '{component.source}', "
+            f"but its highest-priority source is "
+            f"'{current.get('_catalog_name', '<unknown>')}'. "
+            "A bundle component source cannot bypass catalog precedence."
+        )
+    if not current.get("_install_allowed", True):
+        raise BundlerError(
+            f"{kind} '{component.id}' is from a discovery-only catalog; "
+            "installation is not allowed."
+        )
+    if component.version is None:
+        return current
+    if not supports_selected_download:
+        _assert_pinned_version(kind, component.id, component.version, current.get("version"))
+        if not current.get("version"):
+            raise BundlerError(
+                f"{kind} '{component.id}' has no catalog version to verify "
+                f"pin {component.version}."
+            )
+        return current
+
+    selected = get_info(component.id, component.version)
+    if selected is None:
+        raise BundlerError(
+            f"{kind} '{component.id}' has no catalog release for pinned version "
+            f"{component.version} in the highest-priority source."
+        )
+    if selected.get("_catalog_name") != current.get("_catalog_name"):
+        raise BundlerError(
+            f"{kind} '{component.id}' changed catalog sources during version lookup; "
+            "retry after the catalog stack is stable."
+        )
+    if not selected.get("_install_allowed", True):
+        raise BundlerError(
+            f"{kind} '{component.id}' is from a discovery-only catalog; "
+            "installation is not allowed."
+        )
+    _assert_pinned_version(kind, component.id, component.version, selected.get("version"))
+    if not selected.get("version"):
+        raise BundlerError(
+            f"{kind} '{component.id}' has no catalog version to verify "
+            f"pin {component.version}."
+        )
+    return selected
+
+
+def _use_bundled_asset(
+    component: ComponentRef, kind: str, bundled: Path | None,
+    manifest_name: str, *, allow_network: bool,
+) -> bool:
+    if bundled is None or component.source:
+        return False
+    if component.version is None:
+        return True
+    advertised = _bundled_manifest_version(bundled / f"{manifest_name}.yml", manifest_name)
+    if advertised is None:
+        raise BundlerError(
+            f"Bundled {kind.lower()} '{component.id}' has no readable version "
+            f"to verify pin {component.version}."
+        )
+    try:
+        _assert_pinned_version(kind, component.id, component.version, advertised)
+    except BundlerError:
+        if allow_network:
+            return False
+        raise
+    return True
+
+
 class _KindManager(Protocol):
     def is_installed(self, component: ComponentRef) -> bool:
+        pass
+
+    def installed_version(self, component: ComponentRef) -> str | None:
         pass
 
     def install(self, component: ComponentRef) -> None:
@@ -156,6 +241,10 @@ class _PresetKindManager:
         except Exception:  # noqa: BLE001
             return False
 
+    def installed_version(self, component: ComponentRef) -> str | None:
+        pack = self._manager.get_pack(component.id)
+        return pack.version if pack is not None else None
+
     def install(self, component: ComponentRef) -> None:
         self._do_install(component, force=False)
 
@@ -170,16 +259,9 @@ class _PresetKindManager:
         priority = DEFAULT_PRIORITY if component.priority is None else component.priority
 
         bundled = _locate_bundled_preset(component.id)
-        if bundled is not None:
-            # Enforce the manifest pin against the bundled asset's own version,
-            # mirroring the catalog path below (the bundled path previously
-            # skipped the pin entirely).
-            _assert_pinned_version(
-                "Preset",
-                component.id,
-                component.version,
-                _bundled_manifest_version(bundled / "preset.yml", "preset"),
-            )
+        if bundled is not None and _use_bundled_asset(
+            component, "Preset", bundled, "preset", allow_network=self._allow_network
+        ):
             self._manager.install_from_directory(
                 bundled, speckit_version, priority, **({"force": True} if force else {})
             )
@@ -195,18 +277,16 @@ class _PresetKindManager:
         from ..presets import PresetCatalog
 
         catalog = PresetCatalog(self._root)
-        info = catalog.get_pack_info(component.id)
-        if not info:
-            raise BundlerError(f"Preset '{component.id}' not found in any catalog.")
-        if not info.get("_install_allowed", True):
-            raise BundlerError(
-                f"Preset '{component.id}' is from a discovery-only catalog; "
-                "installation is not allowed."
-            )
-        _assert_pinned_version(
-            "Preset", component.id, component.version, info.get("version")
+        download_selected = getattr(catalog, "download_pack_info", None)
+        info = _selected_catalog_info(
+            component, "Preset", catalog.get_pack_info,
+            supports_selected_download=callable(download_selected),
         )
-        zip_path = catalog.download_pack(component.id)
+        zip_path = (
+            download_selected(info)
+            if component.version and callable(download_selected)
+            else catalog.download_pack(component.id)
+        )
         try:
             self._manager.install_from_zip(
                 zip_path,
@@ -214,6 +294,10 @@ class _PresetKindManager:
                 priority,
                 catalog_name=info.get("_catalog_name"),
                 **({"force": True} if force else {}),
+                **(
+                    {"expected_id": component.id, "expected_version": component.version}
+                    if component.version and callable(download_selected) else {}
+                ),
             )
         finally:
             with contextlib.suppress(Exception):
@@ -243,6 +327,10 @@ class _ExtensionKindManager:
         except Exception:  # noqa: BLE001
             return False
 
+    def installed_version(self, component: ComponentRef) -> str | None:
+        metadata = self._manager.registry.get(component.id)
+        return metadata.get("version") if metadata is not None else None
+
     def install(self, component: ComponentRef) -> None:
         self._do_install(component, force=False)
 
@@ -257,16 +345,9 @@ class _ExtensionKindManager:
         priority = DEFAULT_PRIORITY if component.priority is None else component.priority
 
         bundled = _locate_bundled_extension(component.id)
-        if bundled is not None:
-            # Enforce the manifest pin against the bundled asset's own version,
-            # mirroring the catalog path below (the bundled path previously
-            # skipped the pin entirely).
-            _assert_pinned_version(
-                "Extension",
-                component.id,
-                component.version,
-                _bundled_manifest_version(bundled / "extension.yml", "extension"),
-            )
+        if bundled is not None and _use_bundled_asset(
+            component, "Extension", bundled, "extension", allow_network=self._allow_network
+        ):
             manifest = self._manager.install_from_directory(
                 bundled, speckit_version, priority=priority, force=force
             )
@@ -283,20 +364,16 @@ class _ExtensionKindManager:
         from ..extensions import ExtensionCatalog
 
         catalog = ExtensionCatalog(self._root)
-        info = catalog.get_extension_info(component.id)
-        if not info:
-            raise BundlerError(
-                f"Extension '{component.id}' not found in any catalog."
-            )
-        if not info.get("_install_allowed", True):
-            raise BundlerError(
-                f"Extension '{component.id}' is from a discovery-only catalog; "
-                "installation is not allowed."
-            )
-        _assert_pinned_version(
-            "Extension", component.id, component.version, info.get("version")
+        download_selected = getattr(catalog, "download_extension_info", None)
+        info = _selected_catalog_info(
+            component, "Extension", catalog.get_extension_info,
+            supports_selected_download=callable(download_selected),
         )
-        zip_path = catalog.download_extension(component.id)
+        zip_path = (
+            download_selected(info)
+            if component.version and callable(download_selected)
+            else catalog.download_extension(component.id)
+        )
         try:
             manifest = self._manager.install_from_zip(
                 zip_path,
@@ -304,6 +381,10 @@ class _ExtensionKindManager:
                 priority=priority,
                 force=force,
                 catalog_name=info.get("_catalog_name"),
+                **(
+                    {"expected_id": component.id, "expected_version": component.version}
+                    if component.version and callable(download_selected) else {}
+                ),
             )
             self._manager.scaffold_config(manifest.id)
         finally:
@@ -334,11 +415,15 @@ class _WorkflowKindManager:
         except Exception:  # noqa: BLE001
             return False
 
+    def installed_version(self, component: ComponentRef) -> str | None:
+        metadata = self._registry.get(component.id)
+        return metadata.get("version") if metadata is not None else None
+
     def install(self, component: ComponentRef) -> None:
         from .._assets import _locate_bundled_workflow
 
         bundled = _locate_bundled_workflow(component.id)
-        if bundled is not None:
+        if bundled is not None and not component.source:
             workflow_file = bundled / "workflow.yml"
             try:
                 from ..workflows.engine import WorkflowDefinition
@@ -353,18 +438,23 @@ class _WorkflowKindManager:
                     f"Bundled workflow at {workflow_file} declares ID "
                     f"'{definition.id}', expected '{component.id}'."
                 )
-            _assert_pinned_version(
-                "Workflow", component.id, component.version, definition.version
-            )
-            from .. import workflow_add
+            if (
+                component.version is None
+                or parse_version(component.version) == parse_version(definition.version)
+            ):
+                from .. import workflow_add
 
-            with _chdir(self._root):
-                _delegate_command(
-                    "install",
-                    f"workflow '{component.id}'",
-                    lambda: workflow_add(str(workflow_file), dev=True, from_url=None),
+                with _chdir(self._root):
+                    _delegate_command(
+                        "install",
+                        f"workflow '{component.id}'",
+                        lambda: workflow_add(str(workflow_file), dev=True, from_url=None),
+                    )
+                return
+            if not self._allow_network:
+                _assert_pinned_version(
+                    "Workflow", component.id, component.version, definition.version
                 )
-            return
 
         if not self._allow_network:
             raise BundlerError(
@@ -372,33 +462,30 @@ class _WorkflowKindManager:
                 "access is disabled. Installing or refreshing this component "
                 "requires network access; re-run without --offline."
             )
-        self._assert_pinned_version(component)
+        from ..workflows.catalog import WorkflowCatalog
+        from ..workflows.command_add import workflow_add as workflow_add_command
+
+        supports_version = "version" in inspect.signature(workflow_add_command).parameters
+        catalog = WorkflowCatalog(self._root)
+        _selected_catalog_info(
+            component, "Workflow", catalog.get_workflow_info,
+            supports_selected_download=supports_version,
+        )
         from .. import workflow_add
 
         with _chdir(self._root):
             _delegate_command(
                 "install", f"workflow '{component.id}'",
-                lambda: workflow_add(component.id, dev=False, from_url=None),
+                lambda: workflow_add(
+                    component.id, dev=False, from_url=None,
+                    **({"version": component.version} if component.version and supports_version else {}),
+                ),
             )
 
     def refresh(self, component: ComponentRef) -> None:
         # workflow_add is idempotent for already-installed workflows; delegate
         # to the standard install path which handles version refresh correctly.
         self.install(component)
-
-    def _assert_pinned_version(self, component: ComponentRef) -> None:
-        if not component.version:
-            return
-        try:
-            from ..workflows.catalog import WorkflowCatalog
-
-            info = WorkflowCatalog(self._root).get_workflow_info(component.id)
-        except Exception:  # noqa: BLE001 - catalog unreachable: cannot enforce
-            return
-        if info:
-            _assert_pinned_version(
-                "Workflow", component.id, component.version, info.get("version")
-            )
 
     def remove(self, component: ComponentRef) -> None:
         from .. import workflow_remove
@@ -424,6 +511,10 @@ class _StepKindManager:
         except Exception:  # noqa: BLE001
             return False
 
+    def installed_version(self, component: ComponentRef) -> str | None:
+        metadata = self._registry.get(component.id)
+        return metadata.get("version") if metadata is not None else None
+
     def install(self, component: ComponentRef) -> None:
         if not self._allow_network:
             raise BundlerError(
@@ -432,11 +523,25 @@ class _StepKindManager:
                 "network access; re-run without --offline."
             )
         from .. import workflow_step_add
+        from ..workflows.step.command_add import workflow_step_add as step_add_command
+
+        supports_version = "version" in inspect.signature(step_add_command).parameters
+        if component.version or component.source:
+            from ..workflows.step.catalog import StepCatalog
+
+            catalog = StepCatalog(self._root)
+            _selected_catalog_info(
+                component, "Step", catalog.get_step_info,
+                supports_selected_download=supports_version,
+            )
 
         with _chdir(self._root):
             _delegate_command(
                 "install", f"step '{component.id}'",
-                lambda: workflow_step_add(component.id),
+                lambda: workflow_step_add(
+                    component.id,
+                    **({"version": component.version} if component.version and supports_version else {}),
+                ),
             )
 
     def refresh(self, component: ComponentRef) -> None:

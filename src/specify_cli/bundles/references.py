@@ -13,35 +13,47 @@ from __future__ import annotations
 from pathlib import Path
 
 from .manifest import ComponentRef
+from .versioning import parse_version
+
+
+def _version_matches(component: ComponentRef, actual: str | None) -> bool:
+    if component.version is None:
+        return True
+    return bool(actual) and parse_version(component.version) == parse_version(actual)
 
 
 def _resolved_locally(root: Path, component: ComponentRef) -> bool:
     kind = component.kind
     try:
+        from .._assets import (
+            _locate_bundled_extension,
+            _locate_bundled_preset,
+            _locate_bundled_workflow,
+        )
+        from .primitives import _bundled_manifest_version, primitive_manager
+
+        if component.source:
+            return False
         if kind == "presets":
-            from .._assets import _locate_bundled_preset
-            from ..presets import PresetManager
-
-            if _locate_bundled_preset(component.id) is not None:
+            bundled = _locate_bundled_preset(component.id)
+            if bundled is not None and _version_matches(
+                component, _bundled_manifest_version(bundled / "preset.yml", "preset")
+            ):
                 return True
-            return PresetManager(root).get_pack(component.id) is not None
         if kind == "extensions":
-            from .._assets import _locate_bundled_extension
-            from ..extensions import ExtensionManager
-
-            if _locate_bundled_extension(component.id) is not None:
+            bundled = _locate_bundled_extension(component.id)
+            if bundled is not None and _version_matches(
+                component, _bundled_manifest_version(bundled / "extension.yml", "extension")
+            ):
                 return True
-            return ExtensionManager(root).registry.is_installed(component.id)
         if kind == "workflows":
-            from .._assets import _locate_bundled_workflow
-            from ..workflows.catalog import WorkflowRegistry
-
-            if _locate_bundled_workflow(component.id) is not None:
+            bundled = _locate_bundled_workflow(component.id)
+            if bundled is not None and _version_matches(
+                component, _bundled_manifest_version(bundled / "workflow.yml", "workflow")
+            ):
                 return True
-            return WorkflowRegistry(root).is_installed(component.id)
         if kind == "steps":
             from ..workflows import BUILTIN_STEP_TYPES
-            from ..workflows.catalog import StepRegistry
 
             # Step types ship with Spec Kit as built-ins (shell, gate, if, ...)
             # rather than as an on-disk asset directory, so there is no
@@ -53,12 +65,33 @@ def _resolved_locally(root: Path, component: ComponentRef) -> bool:
             # loaded for one project would be accepted as "bundled" when
             # validating another. Without any bundled check at all, every
             # built-in step type looked unresolved.
-            if component.id in BUILTIN_STEP_TYPES:
+            if component.id in BUILTIN_STEP_TYPES and component.version is None:
                 return True
-            return StepRegistry(root).is_installed(component.id)
+        manager = primitive_manager(kind, root, allow_network=False)
+        return manager.is_installed(component) and _version_matches(
+            component, manager.installed_version(component)
+        )
     except Exception:  # noqa: BLE001 - resolution is best-effort
         return False
     return False
+
+
+def _catalog_has_release(component: ComponentRef, get_info) -> bool:
+    current = get_info(component.id)
+    if current is None or not current.get("_install_allowed", True):
+        return False
+    if component.source and component.source != current.get("_catalog_name"):
+        return False
+    if component.version is None:
+        return True
+    if _version_matches(component, current.get("version")):
+        return True
+    import inspect
+
+    if "version" not in inspect.signature(get_info).parameters:
+        return False
+    selected = get_info(component.id, component.version)
+    return selected is not None and selected.get("_install_allowed", True)
 
 
 def _resolved_in_catalog(root: Path, component: ComponentRef) -> bool | None:
@@ -68,19 +101,23 @@ def _resolved_in_catalog(root: Path, component: ComponentRef) -> bool | None:
         if kind == "presets":
             from ..presets import PresetCatalog
 
-            return PresetCatalog(root).get_pack_info(component.id) is not None
+            catalog = PresetCatalog(root)
+            return _catalog_has_release(component, catalog.get_pack_info)
         if kind == "extensions":
             from ..extensions import ExtensionCatalog
 
-            return ExtensionCatalog(root).get_extension_info(component.id) is not None
+            catalog = ExtensionCatalog(root)
+            return _catalog_has_release(component, catalog.get_extension_info)
         if kind == "workflows":
             from ..workflows.catalog import WorkflowCatalog
 
-            return WorkflowCatalog(root).get_workflow_info(component.id) is not None
+            catalog = WorkflowCatalog(root)
+            return _catalog_has_release(component, catalog.get_workflow_info)
         if kind == "steps":
             from ..workflows.catalog import StepCatalog
 
-            return StepCatalog(root).get_step_info(component.id) is not None
+            catalog = StepCatalog(root)
+            return _catalog_has_release(component, catalog.get_step_info)
     except Exception:  # noqa: BLE001 - catalog may be unreachable/misconfigured
         return None
     return None
@@ -109,8 +146,9 @@ def make_reference_checker(
                 return None
             if in_catalog is False:
                 return (
-                    f"{component.kind[:-1]} '{component.id}' is not bundled, "
-                    "installed, or present in any active catalog."
+                    f"{component.kind[:-1]} '{component.id}' at "
+                    f"{component.version or 'current'} is not available from "
+                    "the selected install-allowed catalog or locally."
                 )
             warnings.append(
                 f"Could not verify {component.kind[:-1]} '{component.id}' "
