@@ -664,6 +664,78 @@ def test_bundle_extension_pin_verifies_selected_archive_before_install(
     assert not archive.exists()
 
 
+@pytest.mark.parametrize("archive_version", ["1.0.0", "2.0.0"])
+def test_bundle_preset_pin_verifies_selected_archive_before_install(
+    tmp_path: Path, monkeypatch, archive_version: str,
+):
+    import zipfile
+
+    import specify_cli._assets as assets
+    from specify_cli.presets import PresetCatalog, PresetValidationError
+
+    if not hasattr(PresetCatalog, "download_pack_info"):
+        pytest.skip("exact release downloads require the preset catalog slice")
+
+    archive = tmp_path / "preset.zip"
+    manifest = {
+        "schema_version": "1.0",
+        "preset": {
+            "id": "sample-preset", "name": "Sample", "version": archive_version,
+            "description": "Sample preset",
+        },
+        "requires": {"speckit_version": ">=0.1.0"},
+        "provides": {
+            "templates": [{
+                "type": "template", "name": "spec-template",
+                "file": "templates/spec-template.md",
+            }]
+        },
+    }
+    import yaml
+
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("preset.yml", yaml.safe_dump(manifest))
+        zipped.writestr("templates/spec-template.md", "# Sample\n")
+
+    monkeypatch.setattr(assets, "_locate_bundled_preset", lambda _id: None)
+    looked_up: list[str | None] = []
+    selected = {
+        "id": "sample-preset", "version": "1.0.0", "sha256": "a" * 64,
+        "_install_allowed": True, "_catalog_name": "trusted",
+        "download_url": "https://example.org/sample-preset-1.0.0.zip",
+    }
+
+    def lookup(_self, _id, version=None):
+        looked_up.append(version)
+        return {**selected, "version": "2.0.0"} if version is None else selected
+
+    monkeypatch.setattr(PresetCatalog, "get_pack_info", lookup)
+    monkeypatch.setattr(
+        PresetCatalog, "download_pack_info", lambda _self, info: archive,
+    )
+    monkeypatch.setattr(
+        PresetCatalog, "download_pack",
+        lambda _self, _id: pytest.fail("current URL was requested"),
+    )
+    root = tmp_path / "project"
+    manager = primitive_manager("presets", root, allow_network=True)
+    pin = ComponentRef(
+        kind="presets", id="sample-preset", version="1.0.0",
+        priority=10, strategy="append",
+    )
+
+    if archive_version == "1.0.0":
+        manager.install(pin)
+        assert manager._manager.registry.get("sample-preset")["version"] == "1.0.0"
+    else:
+        with pytest.raises(PresetValidationError, match="expected"):
+            manager.install(pin)
+        assert not manager._manager.registry.is_installed("sample-preset")
+
+    assert looked_up == [None, "1.0.0"]
+    assert not archive.exists()
+
+
 def test_bundled_preset_pin_mismatch_refuses(tmp_path: Path, monkeypatch):
     import specify_cli._assets as assets
     from specify_cli.presets import PresetManager
