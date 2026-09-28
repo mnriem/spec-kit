@@ -543,6 +543,61 @@ specify workflow run speckit -i spec="Build a kanban board with drag-and-drop ta
 
 > **Security note:** a `shell` step runs a local command with **your** privileges. There is no capability sandbox — `requires` is an advisory pre-condition block (spec-kit version, integrations), not a runtime gate, so it does **not** restrict what a step can do. In particular there is no `requires.permissions` capability gate: it is rejected by validation precisely because it would imply a sandbox that does not exist. Review any catalog or downloaded workflow before running it, and use a `gate` step to require explicit approval before sensitive or destructive shell commands.
 
+### Step catalog releases
+
+`specify workflow step info <id> --versions` lists the advertised current and
+historical releases from the winning step catalog. `specify workflow step add
+<id> --version <version>` installs an exact catalog release; without `--version`,
+`add` continues to install the current release. Equivalent PEP 440 version
+spellings (such as `v1.0` and `1.0`) select the same release, preserving the
+catalog's advertised spelling. A missing version does not fall through to a
+lower-priority catalog. Discovery-only sources can list versions but cannot
+install any of them. A project can install only one version of a step ID at a
+time; remove the installed step before adding a different version.
+
+Existing single-version entries remain valid. To publish historical releases,
+keep the current `version`, `step_yml_url` (or `url`), `init_url`, and other
+metadata at the top level; add older releases under `releases`:
+
+```json
+{
+  "steps": {
+    "deploy": {
+      "name": "Deploy",
+      "version": "2.0",
+      "step_yml_url": "https://example.com/deploy/2.0/step.yml",
+      "init_url": "https://example.com/deploy/2.0/__init__.py",
+      "releases": {
+        "1.0": {
+          "step_yml_url": "https://example.com/deploy/1.0/step.yml",
+          "init_url": "https://example.com/deploy/1.0/__init__.py",
+          "extra_files": {
+            "helper.py": "https://example.com/deploy/1.0/helper.py"
+          },
+          "sha256": {
+            "step.yml": "<64 hex digits>",
+            "__init__.py": "<64 hex digits>",
+            "helper.py": "<64 hex digits>"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Each historical record must provide its own step file URL and SHA-256 digests
+for **every** downloaded file (including `__init__.py` and `extra_files`);
+`init_url` may be omitted when it can be derived from a URL ending in
+`step.yml`. For an exact selection of the current version, the top-level entry
+must also include a `sha256` mapping. Release-specific `extra_files` and
+requirements are not inherited from the current release. Duplicated,
+inconsistent, or malformed versions are rejected. Selected files are
+downloaded from their advertised URLs, checked against their digests, and the
+downloaded `step.yml` must declare the selected `step.type_key` and `step.version`.
+Legacy unqualified installs do not require a digest or a `step.version`.
+As with all custom step packages, review the Python code before installing it.
+
 ### Per-Step Integration Configuration
 
 Command steps may pass structured runtime configuration to integrations that

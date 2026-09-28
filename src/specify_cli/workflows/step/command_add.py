@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+from typing import Annotated
+
 from .. import _commands as cli
 from . import step_app
 
@@ -11,6 +14,10 @@ from . import _helpers as step_helpers
 @step_app.command("add")
 def workflow_step_add(
     step_id: str = cli.typer.Argument(..., help="Step type ID from catalog"),
+    version: Annotated[
+        str | None,
+        cli.typer.Option("--version", help="Exact catalog release to install"),
+    ] = None,
 ):
     """Install a custom step type from the step catalog."""
     from .catalog import (
@@ -19,28 +26,47 @@ def workflow_step_add(
         StepRegistry,
         StepValidationError,
     )
+    from .catalog._versions import validate_checksums
 
     project_root = cli._require_specify_project()
 
     catalog = StepCatalog(project_root)
     try:
-        info = catalog.get_step_info(step_id)
+        info = (
+            catalog.get_step_info(step_id, version=version)
+            if version is not None
+            else catalog.get_step_info(step_id)
+        )
     except StepCatalogError as exc:
         cli.console.print(f"[red]Error:[/red] {exc}")
         raise cli.typer.Exit(1)
 
     if not info:
-        cli.console.print(
-            f"[red]Error:[/red] Step type '{step_id}' not found in catalog"
-        )
+        if version is not None:
+            cli.console.print(
+                f"[red]Error:[/red] Step type '{step_id}' version '{version}' "
+                "not found in the winning catalog"
+            )
+        else:
+            cli.console.print(
+                f"[red]Error:[/red] Step type '{step_id}' not found in catalog"
+            )
         raise cli.typer.Exit(1)
 
     if not info.get("_install_allowed", True):
         cli.console.print(
-            f"[yellow]Warning:[/yellow] Step type '{step_id}' is from a discovery-only catalog"
+            f"[yellow]Warning:[/yellow] Step type '{step_id}' "
+            "is from a discovery-only catalog"
         )
         cli.console.print("Direct installation is not enabled for this catalog source.")
         raise cli.typer.Exit(1)
+
+    try:
+        validate_checksums(info, step_id, required=version is not None)
+    except StepCatalogError as exc:
+        cli.console.print(f"[red]Error:[/red] {exc}")
+        raise cli.typer.Exit(1)
+    checksums = info.get("sha256")
 
     # Reject step IDs that collide with built-in step types
     from .. import STEP_REGISTRY as _step_reg
@@ -188,7 +214,17 @@ def workflow_step_add(
     try:
         try:
             step_yml_content = _safe_fetch(step_yml_url)
+            if checksums and (
+                hashlib.sha256(step_yml_content).hexdigest().lower()
+                != checksums["step.yml"].lower()
+            ):
+                raise ValueError("step.yml SHA-256 checksum mismatch")
             init_py_content = _safe_fetch(init_url)
+            if checksums and (
+                hashlib.sha256(init_py_content).hexdigest().lower()
+                != checksums["__init__.py"].lower()
+            ):
+                raise ValueError("__init__.py SHA-256 checksum mismatch")
         except Exception as exc:
             cli.console.print(f"[red]Error:[/red] Failed to download step files: {exc}")
             raise cli.typer.Exit(1)
@@ -253,6 +289,24 @@ def workflow_step_add(
             )
             raise cli.typer.Exit(1)
 
+        if version is not None or "releases" in info:
+            from packaging.version import InvalidVersion, Version
+
+            declared_version = step_meta.get("version")
+            try:
+                matches = (
+                    isinstance(declared_version, str)
+                    and Version(declared_version) == Version(info["version"])
+                )
+            except (InvalidVersion, TypeError, KeyError):
+                matches = False
+            if not matches:
+                cli.console.print(
+                    f"[red]Error:[/red] step.yml version ({declared_version!r}) "
+                    f"does not match catalog version ({info.get('version')!r})"
+                )
+                raise cli.typer.Exit(1)
+
         # Write the two required files.
         try:
             (tmp_path / "step.yml").write_bytes(step_yml_content)
@@ -306,6 +360,11 @@ def workflow_step_add(
                 raise cli.typer.Exit(1)
             try:
                 file_content = _safe_fetch(file_url)
+                if checksums and (
+                    hashlib.sha256(file_content).hexdigest().lower()
+                    != checksums[rel_path].lower()
+                ):
+                    raise ValueError(f"SHA-256 checksum mismatch for '{rel_path}'")
             except Exception as exc:
                 cli.console.print(
                     f"[red]Error:[/red] Failed to download extra file '{rel_path}': {exc}"
